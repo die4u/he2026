@@ -720,7 +720,7 @@ function PhotoFrame({ src, dur, caption, sub, kbFrom = 1.05, kbTo = 1.17, origin
           willChange: 'transform', opacity: ready ? 1 : 0, transition: 'opacity 0.45s ease',
         }} />
       </div>
-      {caption && (
+      {(caption || sub) && (
         <React.Fragment>
           <div style={{
             position: 'absolute', left: 0, right: 0, bottom: 0, height: 320,
@@ -728,8 +728,8 @@ function PhotoFrame({ src, dur, caption, sub, kbFrom = 1.05, kbTo = 1.17, origin
             opacity: capOp, pointerEvents: 'none',
           }} />
           <div style={{ position: 'absolute', left: 64, right: 64, bottom: 60, opacity: capOp, transform: `translateY(${capTy}px)` }}>
-            <div style={{ fontFamily: VFONT, fontWeight: 700, fontSize: 48, color: '#fff', letterSpacing: '-0.01em', textShadow: '0 2px 18px rgba(0,0,0,0.45)' }}>{caption}</div>
-            {sub && <div style={{ fontFamily: VFONT, fontWeight: 500, fontSize: 24, color: 'rgba(255,255,255,0.85)', marginTop: 6 }}>{sub}</div>}
+            {caption && <div style={{ fontFamily: VFONT, fontWeight: 700, fontSize: 48, color: '#fff', letterSpacing: '-0.01em', textShadow: '0 2px 18px rgba(0,0,0,0.45)' }}>{caption}</div>}
+            {sub && <div style={{ fontFamily: VFONT, fontWeight: 500, fontSize: 24, color: 'rgba(255,255,255,0.85)', marginTop: caption ? 6 : 0 }}>{sub}</div>}
           </div>
         </React.Fragment>
       )}
@@ -804,7 +804,9 @@ function PreloadGate({ srcs, children }) {
 // Generated live via Web Audio (no external audio file). I-V-vi-IV in D major
 // with a gentle plucked arp, a singing melody, soft pad, and filtered-noise surf.
 function BeachMusic() {
-  const { playing, time } = React.useContext(TimelineContext);
+  const { playing, time, setTime, setPlaying } = React.useContext(TimelineContext);
+  // Restart the video from the very beginning whenever the track changes.
+  const restartFromStart = () => { try { if (setTime) setTime(0); if (setPlaying) setPlaying(true); } catch (e) {} };
   const [muted, setMuted] = React.useState(() => {
     try { const v = localStorage.getItem('beachtrip:muted'); return v === null ? true : v === '1'; } catch (e) { return true; }
   });
@@ -882,11 +884,13 @@ function BeachMusic() {
     idbSave(f, f.name).catch(() => {});
     setTrackUrl((old) => { if (old) URL.revokeObjectURL(old); return URL.createObjectURL(f); });
     setTrackName(f.name);
+    restartFromStart();
   };
   const clearTrack = () => {
     idbClear().catch(() => {});
     setTrackUrl((old) => { if (old) URL.revokeObjectURL(old); return null; });
     setTrackName(null);
+    restartFromStart();
   };
 
   const ensure = () => {
@@ -1260,6 +1264,10 @@ function EditorPanel({ clips, urls, onUpdate, onRemove, onMove, onAddPhotos, onA
                       <div style={labelStyle}>Lời minh hoạ</div>
                       <input value={c.cap || ''} onChange={(e) => onUpdate(c.id, { cap: e.target.value })} placeholder="Để trống nếu không cần chữ" style={inputStyle} />
                     </div>
+                    <div>
+                      <div style={labelStyle}>Dòng phụ (tuỳ chọn)</div>
+                      <input value={c.sub || ''} onChange={(e) => onUpdate(c.id, { sub: e.target.value })} placeholder="—" style={inputStyle} />
+                    </div>
                   </React.Fragment>
                 )}
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
@@ -1339,7 +1347,7 @@ function BeachTrip() {
       const key = 'up_' + stamp + '_' + i;
       try { await pdbPutImg(key, blob); } catch (e) {}
       newUrls[key] = URL.createObjectURL(blob);
-      newClips.push({ id: 'c' + stamp + '_' + i, imgKey: key, cap: '', dur: 3.0 });
+      newClips.push({ id: 'c' + stamp + '_' + i, imgKey: key, cap: '', dur: 5.0 });
     }
     setUrls((u) => Object.assign({}, u, newUrls));
     setClips((prev) => {
