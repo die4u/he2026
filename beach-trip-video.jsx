@@ -877,19 +877,46 @@ function BeachMusic() {
     return () => { if (url) URL.revokeObjectURL(url); };
   }, []);
 
+  // On (re)mount the music always starts from the very beginning. BeachMusic
+  // lives inside the keyed Stage, so any image change remounts it — this makes
+  // both the uploaded track and the built-in synth replay from zero.
+  React.useEffect(() => {
+    const a = audioRef.current;
+    if (a) { try { a.currentTime = 0; } catch (e) {} }
+    const r = R.current;
+    if (r) { r.step = 0; r.nextTime = 0; }
+  }, []);
+
   const onPick = (e) => {
     const f = e.target.files && e.target.files[0];
     e.target.value = '';
     if (!f) return;
+    const url = URL.createObjectURL(f);
     idbSave(f, f.name).catch(() => {});
-    setTrackUrl((old) => { if (old) URL.revokeObjectURL(old); return URL.createObjectURL(f); });
+    setTrackUrl((old) => { if (old) URL.revokeObjectURL(old); return url; });
     setTrackName(f.name);
+    setMuted(false); // they just chose a song — they want to hear it
+    // Kick off playback right here, inside the click/file-pick gesture, so the
+    // browser allows it. The effect-driven play() runs too late to count as a
+    // user gesture, which is why sound only started after clicking the speaker.
+    const a = audioRef.current;
+    if (a) {
+      try {
+        a.src = url; a.muted = false; a.volume = volume; a.currentTime = 0;
+        const p = a.play(); if (p && p.then) p.catch(() => {});
+      } catch (err) {}
+    }
+    wantPlayRef.current = true;
     restartFromStart();
   };
   const clearTrack = () => {
     idbClear().catch(() => {});
     setTrackUrl((old) => { if (old) URL.revokeObjectURL(old); return null; });
     setTrackName(null);
+    const a = audioRef.current;
+    if (a) { try { a.pause(); } catch (e) {} }
+    // Unlock/resume the synth's AudioContext within this gesture too.
+    try { const r = ensure(); if (r.ctx && r.ctx.state === 'suspended') r.ctx.resume(); } catch (e) {}
     restartFromStart();
   };
 
@@ -1302,6 +1329,13 @@ function BeachTrip() {
   const [urls, setUrls] = React.useState({});     // imgKey -> objectURL
   const [editing, setEditing] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  const [stageKey, setStageKey] = React.useState(0); // bump to remount Stage from the start
+
+  // Replay the video from the beginning (used whenever the set of images changes)
+  const restartFromStart = () => {
+    try { localStorage.setItem('beachtrip:t', '0'); } catch (e) {}
+    setStageKey((k) => k + 1);
+  };
 
   // Load saved project (or defaults) + resolve uploaded image blobs to URLs
   React.useEffect(() => {
@@ -1325,15 +1359,18 @@ function BeachTrip() {
 
   const persist = (next) => { pdbSaveClips(next).catch(() => {}); return next; };
   const onUpdate = (id, patch) => setClips((prev) => persist(prev.map((c) => (c.id === id ? Object.assign({}, c, patch) : c))));
-  const onRemove = (id) => setClips((prev) => persist(prev.filter((c) => c.id !== id)));
-  const onMove = (id, dir) => setClips((prev) => {
-    const i = prev.findIndex((c) => c.id === id);
-    const j = i + dir;
-    if (i < 0 || j < 0 || j >= prev.length) return prev;
-    const a = prev.slice(); const tmp = a[i]; a[i] = a[j]; a[j] = tmp;
-    return persist(a);
-  });
-  const onAddTitle = () => setClips((prev) => persist(prev.concat([{ id: 'c' + Date.now(), type: 'title', title: 'TIÊU ĐỀ MỚI', sub: '', dur: 2.6, variant: 'mini' }])));
+  const onRemove = (id) => { setClips((prev) => persist(prev.filter((c) => c.id !== id))); restartFromStart(); };
+  const onMove = (id, dir) => {
+    setClips((prev) => {
+      const i = prev.findIndex((c) => c.id === id);
+      const j = i + dir;
+      if (i < 0 || j < 0 || j >= prev.length) return prev;
+      const a = prev.slice(); const tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+      return persist(a);
+    });
+    restartFromStart();
+  };
+  const onAddTitle = () => { setClips((prev) => persist(prev.concat([{ id: 'c' + Date.now(), type: 'title', title: 'TIÊU ĐỀ MỚI', sub: '', dur: 2.6, variant: 'mini' }]))); restartFromStart(); };
   const onAddPhotos = async (files, atIndex) => {
     const arr = Array.from(files || []).filter((f) => f.type && f.type.indexOf('image/') === 0);
     if (!arr.length) return;
@@ -1357,11 +1394,13 @@ function BeachTrip() {
       return persist(a);
     });
     setBusy(false);
+    restartFromStart();
   };
   const onReset = async () => {
     try { await pdbClearAll(); } catch (e) {}
     setUrls((prev) => { Object.values(prev).forEach((u) => { try { URL.revokeObjectURL(u); } catch (e) {} }); return {}; });
     setClips(freshDefault());
+    restartFromStart();
   };
 
   if (!clips) {
@@ -1387,7 +1426,7 @@ function BeachTrip() {
     <EditContext.Provider value={{ editing }}>
       <div style={{ position: 'absolute', inset: 0 }}>
         <PreloadGate srcs={photoSrcs}>
-          <Stage width={1600} height={900} duration={total} background="#06121a" persistKey="beachtrip">
+          <Stage key={stageKey} width={1600} height={900} duration={total} background="#06121a" persistKey="beachtrip">
             {items.map((it, i) => (
               <Sprite key={it.id} start={it.start} end={it.end}>
                 {it.type === 'title'
