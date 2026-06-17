@@ -1052,7 +1052,7 @@ function BeachMusic() {
   return (
     <div style={{ position: 'absolute', top: 24, right: 24, zIndex: 30, display: 'flex', alignItems: 'center', gap: 10 }}>
       <audio ref={audioRef} src={trackUrl || undefined} loop preload="auto" />
-      <input ref={fileInputRef} type="file" accept="audio/*" onChange={onPick} style={{ display: 'none' }} />
+      <input ref={fileInputRef} type="file" accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.flac,.opus,.weba" onChange={onPick} style={{ display: 'none' }} />
 
       {hasCustom && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 9, maxWidth: 230, height: 52, padding: '0 8px 0 15px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.25)', background: 'rgba(8,18,26,0.42)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)', color: '#fff', fontFamily: VFONT, fontSize: 15, fontWeight: 600, boxShadow: '0 4px 18px rgba(0,0,0,0.3)' }}>
