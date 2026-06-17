@@ -766,23 +766,24 @@ function TitleCard({ title, sub, dur, variant = 'main' }) {
 }
 
 function PreloadGate({ srcs, children }) {
-  const [loaded, setLoaded] = React.useState(0);
-  const total = srcs.length;
-  const done = loaded >= total;
+  const [pct, setPct] = React.useState(0);
+  const [done, setDone] = React.useState(() => srcs.length === 0);
   React.useEffect(() => {
     let live = true;
+    const list = srcs.slice();
+    const total = list.length;
+    if (total === 0) { setDone(true); return; }
     let n = 0;
-    srcs.forEach((src) => {
+    list.forEach((src) => {
       const im = new Image();
-      const tick = () => { if (!live) return; n += 1; setLoaded(n); };
+      const tick = () => { if (!live) return; n += 1; setPct(Math.round((n / total) * 100)); if (n >= total) setDone(true); };
       im.onload = tick;
       im.onerror = tick;
       im.src = src;
       if (im.complete && im.naturalWidth) tick();
     });
     return () => { live = false; };
-  }, []);
-  const pct = total ? Math.round((loaded / total) * 100) : 100;
+  }, []); // run once with the sources present at mount; later edits don't re-gate
   return (
     <div style={{ position: 'absolute', inset: 0 }}>
       {done && children}
@@ -804,13 +805,45 @@ function PreloadGate({ srcs, children }) {
 // with a gentle plucked arp, a singing melody, soft pad, and filtered-noise surf.
 function BeachMusic() {
   const { playing, time } = React.useContext(TimelineContext);
-  const [muted, setMuted] = React.useState(false);
+  const [muted, setMuted] = React.useState(() => {
+    try { const v = localStorage.getItem('beachtrip:muted'); return v === null ? true : v === '1'; } catch (e) { return true; }
+  });
+  React.useEffect(() => { try { localStorage.setItem('beachtrip:muted', muted ? '1' : '0'); } catch (e) {} }, [muted]);
+  const [volume, setVolume] = React.useState(() => {
+    try { const v = parseFloat(localStorage.getItem('beachtrip:vol')); return isFinite(v) ? Math.min(1, Math.max(0, v)) : 0.85; } catch (e) { return 0.85; }
+  });
+  React.useEffect(() => { try { localStorage.setItem('beachtrip:vol', String(volume)); } catch (e) {} }, [volume]);
   const [trackName, setTrackName] = React.useState(null); // null = built-in synth
   const [trackUrl, setTrackUrl] = React.useState(null);
   const audioRef = React.useRef(null);
   const fileInputRef = React.useRef(null);
   const R = React.useRef({});
+  const wantPlayRef = React.useRef(false);
   const hasCustom = !!trackUrl;
+
+  // Unlock audio on the first user gesture anywhere (browsers block play()/
+  // AudioContext from a deferred effect until the user has interacted once).
+  React.useEffect(() => {
+    let done = false;
+    const unlock = () => {
+      if (done) return; done = true;
+      const r = R.current;
+      if (r.ctx && r.ctx.state === 'suspended') { r.ctx.resume().catch(() => {}); }
+      const a = audioRef.current;
+      if (a && a.getAttribute('src')) {
+        const p = a.play();
+        if (p && p.then) p.then(() => { if (!wantPlayRef.current) a.pause(); }).catch(() => {});
+      }
+      window.removeEventListener('pointerdown', unlock, true);
+      window.removeEventListener('keydown', unlock, true);
+    };
+    window.addEventListener('pointerdown', unlock, true);
+    window.addEventListener('keydown', unlock, true);
+    return () => {
+      window.removeEventListener('pointerdown', unlock, true);
+      window.removeEventListener('keydown', unlock, true);
+    };
+  }, []);
 
   const m2f = (m) => 440 * Math.pow(2, (m - 69) / 12);
 
@@ -952,6 +985,7 @@ function BeachMusic() {
 
   React.useEffect(() => {
     const a = audioRef.current;
+    wantPlayRef.current = hasCustom && playing;
     if (hasCustom) {
       // silence + stop the built-in synth entirely
       const r = R.current;
@@ -962,6 +996,7 @@ function BeachMusic() {
       }
       if (a) {
         a.muted = muted;
+        a.volume = volume;
         if (playing) {
           try { const d = a.duration; if (d && isFinite(d)) a.currentTime = time % d; } catch (e) {}
           a.play().catch(() => {});
@@ -971,22 +1006,35 @@ function BeachMusic() {
       }
       return;
     }
-    if (playing) {
+    if (playing && !muted) {
       const r = ensure();
       r.ctx.resume();
       if (!r.nextTime || r.nextTime < r.ctx.currentTime) r.nextTime = r.ctx.currentTime + 0.1;
       r.master.gain.cancelScheduledValues(r.ctx.currentTime);
-      r.master.gain.setTargetAtTime(muted ? 0 : 0.85, r.ctx.currentTime, 0.4);
+      r.master.gain.setTargetAtTime(volume, r.ctx.currentTime, 0.4);
       if (!r.interval) r.interval = setInterval(tick, 25);
     } else {
+      // paused OR muted: stop the scheduler entirely so nothing leaks through
       const r = R.current;
       if (r.ctx) {
         r.master.gain.cancelScheduledValues(r.ctx.currentTime);
-        r.master.gain.setTargetAtTime(0, r.ctx.currentTime, 0.25);
+        r.master.gain.setTargetAtTime(0, r.ctx.currentTime, 0.2);
         if (r.interval) { clearInterval(r.interval); r.interval = null; }
       }
     }
   }, [playing, muted, hasCustom]);
+
+  // Volume is its own effect so dragging the slider only adjusts the level —
+  // it never re-seeks or restarts the audio (which made changes inaudible).
+  React.useEffect(() => {
+    const a = audioRef.current;
+    if (a) a.volume = volume;
+    const r = R.current;
+    if (r.ctx && r.master && !hasCustom && playing && !muted) {
+      r.master.gain.cancelScheduledValues(r.ctx.currentTime);
+      r.master.gain.setTargetAtTime(volume, r.ctx.currentTime, 0.08);
+    }
+  }, [volume, muted, hasCustom, playing]);
 
   React.useEffect(() => () => {
     const r = R.current;
@@ -1022,6 +1070,13 @@ function BeachMusic() {
         </svg>
       </button>
 
+      <div style={{ display: 'flex', alignItems: 'center', gap: 11, height: 52, padding: '0 18px 0 16px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.25)', background: 'rgba(8,18,26,0.42)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)', color: '#fff', boxShadow: '0 4px 18px rgba(0,0,0,0.3)' }}>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, opacity: 0.9 }}>
+          <path d="M11 5 6 9H2v6h4l5 4z" fill="currentColor" stroke="none"/>
+        </svg>
+        <input type="range" min="0" max="100" value={Math.round(volume * 100)} onChange={(e) => setVolume(Number(e.target.value) / 100)} title={'Âm lượng ' + Math.round(volume * 100) + '%'} style={{ width: 96, accentColor: '#5cc6d6', cursor: 'pointer' }} />
+      </div>
+
       <button onClick={() => setMuted((x) => !x)} title={muted ? 'Bật nhạc' : 'Tắt nhạc'} style={pill}>
         {muted ? (
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1037,65 +1092,324 @@ function BeachMusic() {
   );
 }
 
-function BeachTrip() {
-  const OVERLAP = 0.5;
-  const seq = [
-    { type: 'title', title: 'CHUYẾN ĐI CHƠI BIỂN', sub: 'Một ngày hè đáng nhớ của gia đình mình', dur: 3.8 },
-    { src: 'img/IMG_5718.jpeg', cap: 'Bắt đầu từ sân nhà…', dur: 3.2 },
-    { src: 'img/IMG_5717.jpeg', cap: '484 Lý Thái Tổ', dur: 3.0 },
-    { src: 'img/IMG_5715.jpeg', cap: 'Hai mẹ con lên đường', dur: 3.0 },
-    { type: 'title', title: 'RA TỚI BIỂN', dur: 2.6, variant: 'mini' },
-    { src: 'img/IMG_5710.jpeg', cap: 'Biển gọi tên mình rồi!', dur: 3.2 },
-    { src: 'img/IMG_5709.jpeg', dur: 2.8 },
-    { src: 'img/IMG_5690.jpeg', cap: 'Trời xanh, biển rộng', dur: 2.8 },
-    { src: 'img/IMG_5703.jpeg', cap: 'Tạo dáng chút nào', dur: 3.0 },
-    { src: 'img/IMG_5695.jpeg', cap: 'Nắm tay nhau ra khơi', dur: 3.2 },
-    { src: 'img/IMG_5691.jpeg', cap: 'Vui hết cỡ!', dur: 3.0 },
-    { src: 'img/IMG_5601.jpeg', cap: 'Sóng tới rồi!', dur: 2.8 },
-    { src: 'img/IMG_5595.jpeg', dur: 2.6 },
-    { src: 'img/IMG_5625.jpeg', cap: 'Cười thật tươi', dur: 3.0 },
-    { src: 'img/IMG_5618.jpeg', dur: 2.6 },
-    { src: 'img/IMG_5574.jpeg', cap: 'Cả nhà cùng nghịch nước', dur: 3.0 },
-    { type: 'title', title: 'NHỮNG ĐIỀU THÚ VỊ', dur: 2.6, variant: 'mini' },
-    { src: 'img/IMG_5671.jpeg', cap: 'Bạn cua nhỏ ghé chơi', dur: 3.0 },
-    { src: 'img/IMG_5670.jpeg', cap: 'Máy bay vút qua trời', dur: 2.8 },
-    { src: 'img/IMG_5664.jpeg', cap: 'Thuyền thúng phơi nắng', dur: 3.0 },
-    { src: 'img/IMG_5669.jpeg', cap: 'Tập bơi nào!', dur: 3.0 },
-    { type: 'title', title: 'HOÀNG HÔN', dur: 2.6, variant: 'mini' },
-    { src: 'img/IMG_5682.jpeg', cap: 'Hoàng hôn buông xuống', dur: 3.4 },
-    { src: 'img/IMG_5663.jpeg', dur: 2.8 },
-    { src: 'img/IMG_5662.jpeg', cap: 'Hoa giấy bên đường', dur: 3.0 },
-    { src: 'img/IMG_5661.jpeg', dur: 2.8 },
-    { src: 'img/IMG_5570.jpeg', cap: 'Đi cùng nhau vui hơn', dur: 3.2 },
-    { src: 'img/IMG_5569.jpeg', dur: 2.8 },
-    { src: 'img/IMG_5559.jpeg', cap: 'Một chút bình yên', dur: 3.4 },
-    { type: 'title', title: 'MÃI BÊN NHAU ♡', sub: 'Hẹn gặp lại nhé, biển ơi!', dur: 4.6, variant: 'final' },
-  ];
+// ── Editable project: default storyboard + persistence ──────────────────────
 
-  let t = 0;
-  const items = seq.map((s) => {
-    const dur = s.dur != null ? s.dur : 3.0;
-    const start = t;
-    t += (dur - OVERLAP);
-    return Object.assign({}, s, { start, dur, end: start + dur });
+const EditContext = React.createContext({ editing: false });
+
+const DEFAULT_SEQ = [
+  { type: 'title', title: 'CHUYẾN ĐI CHƠI BIỂN', sub: 'Một ngày hè đáng nhớ của gia đình mình', dur: 3.8 },
+  { src: 'img/IMG_5718.jpeg', cap: 'Bắt đầu từ sân nhà…', dur: 3.2 },
+  { src: 'img/IMG_5717.jpeg', cap: '484 Lý Thái Tổ', dur: 3.0 },
+  { src: 'img/IMG_5715.jpeg', cap: 'Hai mẹ con lên đường', dur: 3.0 },
+  { type: 'title', title: 'RA TỚI BIỂN', dur: 2.6, variant: 'mini' },
+  { src: 'img/IMG_5710.jpeg', cap: 'Biển gọi tên mình rồi!', dur: 3.2 },
+  { src: 'img/IMG_5709.jpeg', dur: 2.8 },
+  { src: 'img/IMG_5690.jpeg', cap: 'Trời xanh, biển rộng', dur: 2.8 },
+  { src: 'img/IMG_5703.jpeg', cap: 'Tạo dáng chút nào', dur: 3.0 },
+  { src: 'img/IMG_5695.jpeg', cap: 'Nắm tay nhau ra khơi', dur: 3.2 },
+  { src: 'img/IMG_5691.jpeg', cap: 'Vui hết cỡ!', dur: 3.0 },
+  { src: 'img/IMG_5601.jpeg', cap: 'Sóng tới rồi!', dur: 2.8 },
+  { src: 'img/IMG_5595.jpeg', dur: 2.6 },
+  { src: 'img/IMG_5625.jpeg', cap: 'Cười thật tươi', dur: 3.0 },
+  { src: 'img/IMG_5618.jpeg', dur: 2.6 },
+  { src: 'img/IMG_5574.jpeg', cap: 'Cả nhà cùng nghịch nước', dur: 3.0 },
+  { type: 'title', title: 'NHỮNG ĐIỀU THÚ VỊ', dur: 2.6, variant: 'mini' },
+  { src: 'img/IMG_5671.jpeg', cap: 'Bạn cua nhỏ ghé chơi', dur: 3.0 },
+  { src: 'img/IMG_5670.jpeg', cap: 'Máy bay vút qua trời', dur: 2.8 },
+  { src: 'img/IMG_5664.jpeg', cap: 'Thuyền thúng phơi nắng', dur: 3.0 },
+  { src: 'img/IMG_5669.jpeg', cap: 'Tập bơi nào!', dur: 3.0 },
+  { type: 'title', title: 'HOÀNG HÔN', dur: 2.6, variant: 'mini' },
+  { src: 'img/IMG_5682.jpeg', cap: 'Hoàng hôn buông xuống', dur: 3.4 },
+  { src: 'img/IMG_5663.jpeg', dur: 2.8 },
+  { src: 'img/IMG_5662.jpeg', cap: 'Hoa giấy bên đường', dur: 3.0 },
+  { src: 'img/IMG_5661.jpeg', dur: 2.8 },
+  { src: 'img/IMG_5570.jpeg', cap: 'Đi cùng nhau vui hơn', dur: 3.2 },
+  { src: 'img/IMG_5569.jpeg', dur: 2.8 },
+  { src: 'img/IMG_5559.jpeg', cap: 'Một chút bình yên', dur: 3.4 },
+  { type: 'title', title: 'MÃI BÊN NHAU ♡', sub: 'Hẹn gặp lại nhé, biển ơi!', dur: 4.6, variant: 'final' },
+].map((s, i) => Object.assign({ id: 'd' + i }, s));
+
+const freshDefault = () => DEFAULT_SEQ.map((c) => Object.assign({}, c));
+
+// IndexedDB project store: clip list (meta) + uploaded image blobs (imgs)
+const projDB = () => new Promise((res, rej) => {
+  const o = indexedDB.open('beachtrip-project', 1);
+  o.onupgradeneeded = () => {
+    const db = o.result;
+    if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
+    if (!db.objectStoreNames.contains('imgs')) db.createObjectStore('imgs');
+  };
+  o.onerror = () => rej(o.error);
+  o.onsuccess = () => res(o.result);
+});
+const pdbGetClips = async () => { const db = await projDB(); return new Promise((res, rej) => { const rq = db.transaction('meta').objectStore('meta').get('clips'); rq.onsuccess = () => res(rq.result || null); rq.onerror = () => rej(rq.error); }); };
+const pdbSaveClips = async (clips) => { const db = await projDB(); return new Promise((res, rej) => { const tx = db.transaction('meta', 'readwrite'); tx.objectStore('meta').put(clips, 'clips'); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); };
+const pdbPutImg = async (key, blob) => { const db = await projDB(); return new Promise((res, rej) => { const tx = db.transaction('imgs', 'readwrite'); tx.objectStore('imgs').put(blob, key); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); };
+const pdbGetImg = async (key) => { const db = await projDB(); return new Promise((res, rej) => { const rq = db.transaction('imgs').objectStore('imgs').get(key); rq.onsuccess = () => res(rq.result || null); rq.onerror = () => rej(rq.error); }); };
+const pdbClearAll = async () => { const db = await projDB(); return new Promise((res, rej) => { const tx = db.transaction(['meta', 'imgs'], 'readwrite'); tx.objectStore('meta').clear(); tx.objectStore('imgs').clear(); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); };
+
+// Downscale an uploaded image to keep things light (long side ≤ 2000px, q=0.9)
+function resizeToBlob(file, max = 2000, q = 0.9) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      let w = img.naturalWidth, h = img.naturalHeight;
+      const s = Math.min(1, max / Math.max(w, h));
+      w = Math.round(w * s); h = Math.round(h * s);
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const ctx = c.getContext('2d');
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, 0, 0, w, h);
+      c.toBlob((b) => { URL.revokeObjectURL(url); b ? resolve(b) : reject(new Error('toBlob failed')); }, 'image/jpeg', q);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decode failed')); };
+    img.src = url;
   });
-  const total = t + OVERLAP + 0.4;
-  const photoSrcs = items.filter((it) => it.src).map((it) => it.src);
+}
+
+// Pauses the stage automatically when the editor opens (lives inside the Stage)
+function StageEditBridge() {
+  const { setPlaying } = React.useContext(TimelineContext);
+  const { editing } = React.useContext(EditContext);
+  React.useEffect(() => { if (editing && setPlaying) setPlaying(false); }, [editing]);
+  return null;
+}
+
+// ── Editor panel ────────────────────────────────────────────────────────────
+
+function EditorPanel({ clips, urls, onUpdate, onRemove, onMove, onAddPhotos, onAddTitle, onReset, onClose, busy }) {
+  const fileRef = React.useRef(null);
+  const pendingIndexRef = React.useRef(null);
+  const triggerAdd = (atIndex) => { pendingIndexRef.current = atIndex; if (fileRef.current) fileRef.current.click(); };
+  const InsertRail = ({ index }) => (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '-2px 6px' }}>
+      <div style={{ flex: 1, height: 1, background: '#dde6e9' }} />
+      <button onClick={() => triggerAdd(index)} disabled={busy} title="Chèn ảnh vào vị trí này" style={{ fontFamily: VFONT, fontSize: 12, fontWeight: 700, color: '#0c6d7e', background: '#e8f1f3', border: 'none', borderRadius: 999, padding: '4px 12px', cursor: busy ? 'default' : 'pointer', display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        Chèn ảnh
+      </button>
+      <div style={{ flex: 1, height: 1, background: '#dde6e9' }} />
+    </div>
+  );
+  const inputStyle = { width: '100%', boxSizing: 'border-box', fontFamily: VFONT, fontSize: 14, fontWeight: 500, color: '#13303c', background: '#fff', border: '1px solid #d4dde2', borderRadius: 9, padding: '8px 10px', outline: 'none' };
+  const labelStyle = { fontFamily: VFONT, fontSize: 11, fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#7d909a', marginBottom: 5 };
+  const iconBtn = { width: 30, height: 30, borderRadius: 8, border: '1px solid #d4dde2', background: '#fff', color: '#3a5562', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0, flexShrink: 0 };
 
   return (
-    <PreloadGate srcs={photoSrcs}>
-    <Stage width={1600} height={900} duration={total} background="#06121a" persistKey="beachtrip">
-      {items.map((it, i) => (
-        <Sprite key={i} start={it.start} end={it.end}>
-          {it.type === 'title'
-            ? <TitleCard title={it.title} sub={it.sub} dur={it.dur} variant={it.variant || 'main'} />
-            : <PhotoFrame src={it.src} dur={it.dur} caption={it.cap} sub={it.sub} />}
-        </Sprite>
-      ))}
-      <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', boxShadow: 'inset 0 0 240px rgba(0,0,0,0.55)' }} />
-      <BeachMusic />
-    </Stage>
-    </PreloadGate>
+    <div style={{ position: 'absolute', top: 0, right: 0, bottom: 0, width: 408, maxWidth: '92vw', zIndex: 50, background: '#f3f6f7', boxShadow: '-18px 0 60px rgba(0,0,0,0.4)', display: 'flex', flexDirection: 'column', fontFamily: VFONT }}>
+      <div style={{ padding: '20px 22px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#0e4257', color: '#fff' }}>
+        <div>
+          <div style={{ fontSize: 19, fontWeight: 800, letterSpacing: '-0.01em' }}>Chỉnh sửa video</div>
+          <div style={{ fontSize: 13, fontWeight: 500, color: 'rgba(255,255,255,0.72)', marginTop: 2 }}>Ảnh & lời minh hoạ · {clips.length} cảnh</div>
+        </div>
+        <button onClick={onClose} title="Đóng" style={{ width: 38, height: 38, borderRadius: 999, border: 'none', background: 'rgba(255,255,255,0.16)', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+        </button>
+      </div>
+
+      <div style={{ padding: '14px 18px', display: 'flex', gap: 10, borderBottom: '1px solid #e0e7ea', background: '#fff' }}>
+        <input ref={fileRef} type="file" accept="image/*" multiple onChange={(e) => { onAddPhotos(e.target.files, pendingIndexRef.current); pendingIndexRef.current = null; e.target.value = ''; }} style={{ display: 'none' }} />
+        <button onClick={() => triggerAdd(null)} disabled={busy} style={{ flex: 1, fontFamily: VFONT, fontSize: 14, fontWeight: 700, color: '#fff', background: busy ? '#88a4ae' : '#0c6d7e', border: 'none', borderRadius: 10, padding: '11px 12px', cursor: busy ? 'default' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+          {busy ? 'Đang thêm…' : 'Thêm ảnh vào cuối'}
+        </button>
+        <button onClick={onAddTitle} title="Thêm thẻ tiêu đề" style={{ fontFamily: VFONT, fontSize: 14, fontWeight: 700, color: '#0c6d7e', background: '#e3eff1', border: 'none', borderRadius: 10, padding: '11px 14px', cursor: 'pointer' }}>+ Tiêu đề</button>
+      </div>
+
+      <div style={{ flex: 1, overflowY: 'auto', padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {clips.map((c, i) => {
+          const isTitle = c.type === 'title';
+          const thumb = c.imgKey ? urls[c.imgKey] : c.src;
+          return (
+            <React.Fragment key={c.id}>
+            <InsertRail index={i} />
+            <div style={{ background: '#fff', border: '1px solid #e3e9ec', borderRadius: 13, padding: 12, display: 'flex', gap: 12, boxShadow: '0 1px 3px rgba(20,48,60,0.05)' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                <div style={{ width: 30, height: 22, borderRadius: 6, background: '#eef3f4', color: '#5a7079', fontSize: 12, fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{i + 1}</div>
+                <button onClick={() => onMove(c.id, -1)} disabled={i === 0} style={Object.assign({}, iconBtn, { opacity: i === 0 ? 0.35 : 1, width: 30, height: 26 })} title="Lên">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M18 15l-6-6-6 6"/></svg>
+                </button>
+                <button onClick={() => onMove(c.id, 1)} disabled={i === clips.length - 1} style={Object.assign({}, iconBtn, { opacity: i === clips.length - 1 ? 0.35 : 1, width: 30, height: 26 })} title="Xuống">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+                </button>
+              </div>
+
+              <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {isTitle ? (
+                  <React.Fragment>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 11, fontWeight: 800, color: '#b4632a', background: '#fbeadd', borderRadius: 6, padding: '3px 8px', letterSpacing: '0.04em' }}>TIÊU ĐỀ</span>
+                    </div>
+                    <div>
+                      <div style={labelStyle}>Dòng chữ lớn</div>
+                      <input value={c.title || ''} onChange={(e) => onUpdate(c.id, { title: e.target.value })} style={inputStyle} />
+                    </div>
+                    <div>
+                      <div style={labelStyle}>Dòng phụ (tuỳ chọn)</div>
+                      <input value={c.sub || ''} onChange={(e) => onUpdate(c.id, { sub: e.target.value })} placeholder="—" style={inputStyle} />
+                    </div>
+                  </React.Fragment>
+                ) : (
+                  <React.Fragment>
+                    <div style={{ width: '100%', aspectRatio: '16 / 9', borderRadius: 9, overflow: 'hidden', background: '#dfe7ea', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      {thumb ? <img src={thumb} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <span style={{ color: '#8aa0a8', fontSize: 13 }}>—</span>}
+                    </div>
+                    <div>
+                      <div style={labelStyle}>Lời minh hoạ</div>
+                      <input value={c.cap || ''} onChange={(e) => onUpdate(c.id, { cap: e.target.value })} placeholder="Để trống nếu không cần chữ" style={inputStyle} />
+                    </div>
+                  </React.Fragment>
+                )}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 600, color: '#3a5562' }}>
+                    Thời lượng
+                    <input type="number" min="0.6" max="12" step="0.2" value={c.dur} onChange={(e) => { const v = parseFloat(e.target.value); onUpdate(c.id, { dur: isFinite(v) ? Math.min(12, Math.max(0.6, v)) : 3 }); }} style={{ width: 64, fontFamily: VFONT, fontSize: 14, fontWeight: 600, color: '#13303c', border: '1px solid #d4dde2', borderRadius: 8, padding: '6px 8px', outline: 'none' }} />
+                    <span style={{ color: '#7d909a', fontSize: 13 }}>giây</span>
+                  </label>
+                  <button onClick={() => onRemove(c.id)} title="Xoá cảnh" style={Object.assign({}, iconBtn, { color: '#c0392b', borderColor: '#f0d2cd' })}>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+            </React.Fragment>
+          );
+        })}
+        <InsertRail index={clips.length} />
+      </div>
+
+      <div style={{ padding: '13px 18px', borderTop: '1px solid #e0e7ea', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <button onClick={onReset} style={{ fontFamily: VFONT, fontSize: 13, fontWeight: 600, color: '#7d909a', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>↺ Khôi phục mặc định</button>
+        <button onClick={onClose} style={{ fontFamily: VFONT, fontSize: 14, fontWeight: 700, color: '#fff', background: '#0e4257', border: 'none', borderRadius: 10, padding: '10px 22px', cursor: 'pointer' }}>Xong</button>
+      </div>
+    </div>
+  );
+}
+
+function BeachTrip() {
+  const OVERLAP = 0.5;
+  const [clips, setClips] = React.useState(null); // null = loading from store
+  const [urls, setUrls] = React.useState({});     // imgKey -> objectURL
+  const [editing, setEditing] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+
+  // Load saved project (or defaults) + resolve uploaded image blobs to URLs
+  React.useEffect(() => {
+    let alive = true;
+    (async () => {
+      let saved = null;
+      try { saved = await pdbGetClips(); } catch (e) {}
+      const base = (saved && Array.isArray(saved) && saved.length) ? saved : freshDefault();
+      const u = {};
+      for (const c of base) {
+        if (c.imgKey) {
+          try { const blob = await pdbGetImg(c.imgKey); if (blob) u[c.imgKey] = URL.createObjectURL(blob); } catch (e) {}
+        }
+      }
+      if (!alive) return;
+      setUrls(u);
+      setClips(base);
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const persist = (next) => { pdbSaveClips(next).catch(() => {}); return next; };
+  const onUpdate = (id, patch) => setClips((prev) => persist(prev.map((c) => (c.id === id ? Object.assign({}, c, patch) : c))));
+  const onRemove = (id) => setClips((prev) => persist(prev.filter((c) => c.id !== id)));
+  const onMove = (id, dir) => setClips((prev) => {
+    const i = prev.findIndex((c) => c.id === id);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= prev.length) return prev;
+    const a = prev.slice(); const tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+    return persist(a);
+  });
+  const onAddTitle = () => setClips((prev) => persist(prev.concat([{ id: 'c' + Date.now(), type: 'title', title: 'TIÊU ĐỀ MỚI', sub: '', dur: 2.6, variant: 'mini' }])));
+  const onAddPhotos = async (files, atIndex) => {
+    const arr = Array.from(files || []).filter((f) => f.type && f.type.indexOf('image/') === 0);
+    if (!arr.length) return;
+    setBusy(true);
+    const stamp = Date.now();
+    const newUrls = {};
+    const newClips = [];
+    for (let i = 0; i < arr.length; i++) {
+      let blob;
+      try { blob = await resizeToBlob(arr[i], 2000, 0.9); } catch (e) { blob = arr[i]; }
+      const key = 'up_' + stamp + '_' + i;
+      try { await pdbPutImg(key, blob); } catch (e) {}
+      newUrls[key] = URL.createObjectURL(blob);
+      newClips.push({ id: 'c' + stamp + '_' + i, imgKey: key, cap: '', dur: 3.0 });
+    }
+    setUrls((u) => Object.assign({}, u, newUrls));
+    setClips((prev) => {
+      const at = (atIndex == null || atIndex > prev.length) ? prev.length : Math.max(0, atIndex);
+      const a = prev.slice();
+      a.splice(at, 0, ...newClips);
+      return persist(a);
+    });
+    setBusy(false);
+  };
+  const onReset = async () => {
+    try { await pdbClearAll(); } catch (e) {}
+    setUrls((prev) => { Object.values(prev).forEach((u) => { try { URL.revokeObjectURL(u); } catch (e) {} }); return {}; });
+    setClips(freshDefault());
+  };
+
+  if (!clips) {
+    return (
+      <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(155deg,#0a2735 0%,#0e4257 55%,#0c6d7e 100%)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <div style={{ fontFamily: VFONT, fontWeight: 800, fontSize: 34, color: '#fff' }}>Đang mở video…</div>
+      </div>
+    );
+  }
+
+  let t = 0;
+  const items = clips.map((c) => {
+    const dur = c.dur != null ? c.dur : 3.0;
+    const start = t;
+    t += (dur - OVERLAP);
+    const src = c.imgKey ? urls[c.imgKey] : c.src;
+    return Object.assign({}, c, { src, start, dur, end: start + dur });
+  });
+  const total = t + OVERLAP + 0.4;
+  const photoSrcs = items.filter((it) => it.type !== 'title' && it.src).map((it) => it.src);
+
+  return (
+    <EditContext.Provider value={{ editing }}>
+      <div style={{ position: 'absolute', inset: 0 }}>
+        <PreloadGate srcs={photoSrcs}>
+          <Stage width={1600} height={900} duration={total} background="#06121a" persistKey="beachtrip">
+            {items.map((it, i) => (
+              <Sprite key={it.id} start={it.start} end={it.end}>
+                {it.type === 'title'
+                  ? <TitleCard title={it.title} sub={it.sub} dur={it.dur} variant={it.variant || 'main'} />
+                  : <PhotoFrame src={it.src} dur={it.dur} caption={it.cap} sub={it.sub} />}
+              </Sprite>
+            ))}
+            <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', boxShadow: 'inset 0 0 240px rgba(0,0,0,0.55)' }} />
+            <BeachMusic />
+            <StageEditBridge />
+          </Stage>
+        </PreloadGate>
+
+        {!editing && (
+          <button onClick={() => setEditing(true)} title="Chỉnh sửa ảnh & lời" style={{ position: 'absolute', top: 24, left: 24, zIndex: 40, height: 52, padding: '0 20px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.25)', background: 'rgba(8,18,26,0.42)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 9, fontFamily: VFONT, fontSize: 15, fontWeight: 700, boxShadow: '0 4px 18px rgba(0,0,0,0.3)' }}>
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+            Chỉnh sửa
+          </button>
+        )}
+
+        {editing && (
+          <EditorPanel
+            clips={clips} urls={urls} busy={busy}
+            onUpdate={onUpdate} onRemove={onRemove} onMove={onMove}
+            onAddPhotos={onAddPhotos} onAddTitle={onAddTitle} onReset={onReset}
+            onClose={() => setEditing(false)}
+          />
+        )}
+      </div>
+    </EditContext.Provider>
   );
 }
 
