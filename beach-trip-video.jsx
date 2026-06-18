@@ -338,6 +338,7 @@ function Stage({
   loop = true,
   autoplay = true,
   persistKey = 'animstage',
+  restartSignal = 0,
   children,
 }) {
   const [time, setTime] = React.useState(() => {
@@ -349,6 +350,17 @@ function Stage({
   const [playing, setPlaying] = React.useState(autoplay);
   const [hoverTime, setHoverTime] = React.useState(null);
   const [scale, setScale] = React.useState(1);
+
+  // Imperative restart: a parent (the editor) bumps restartSignal whenever the
+  // set of images changes. We seek the timeline back to 0 and resume WITHOUT
+  // remounting the Stage — so the music element inside it is never torn down
+  // (which used to drop the soundtrack and re-trigger blocked autoplay).
+  const firstSignal = React.useRef(restartSignal);
+  React.useEffect(() => {
+    if (restartSignal === firstSignal.current) return; // ignore the initial mount value
+    setTime(0);
+    setPlaying(true);
+  }, [restartSignal]);
 
   const stageRef = React.useRef(null);
   const canvasRef = React.useRef(null);
@@ -431,8 +443,8 @@ function Stage({
   const displayTime = hoverTime != null ? hoverTime : time;
 
   const ctxValue = React.useMemo(
-    () => ({ time: displayTime, duration, playing, setTime, setPlaying }),
-    [displayTime, duration, playing]
+    () => ({ time: displayTime, duration, playing, setTime, setPlaying, restartSignal }),
+    [displayTime, duration, playing, restartSignal]
   );
 
   return (
@@ -804,7 +816,7 @@ function PreloadGate({ srcs, children }) {
 // Generated live via Web Audio (no external audio file). I-V-vi-IV in D major
 // with a gentle plucked arp, a singing melody, soft pad, and filtered-noise surf.
 function BeachMusic() {
-  const { playing, time, setTime, setPlaying } = React.useContext(TimelineContext);
+  const { playing, time, setTime, setPlaying, restartSignal } = React.useContext(TimelineContext);
   // Restart the video from the very beginning whenever the track changes.
   const restartFromStart = () => { try { if (setTime) setTime(0); if (setPlaying) setPlaying(true); } catch (e) {} };
   const [muted, setMuted] = React.useState(() => {
@@ -887,19 +899,47 @@ function BeachMusic() {
     if (r) { r.step = 0; r.nextTime = 0; }
   }, []);
 
+  // The editor bumps restartSignal whenever the storyboard changes. The Stage no
+  // longer remounts (that used to drop the audio), so we reset the live track to
+  // the top ourselves — without ever tearing it down, so sound keeps coming.
+  const firstRestart = React.useRef(restartSignal);
+  React.useEffect(() => {
+    if (restartSignal === firstRestart.current) return; // skip initial mount
+    const a = audioRef.current;
+    if (a && a.getAttribute('src')) {
+      try { a.currentTime = 0; if (!muted) { const p = a.play(); if (p && p.then) p.catch(() => {}); } } catch (e) {}
+    }
+    const r = R.current;
+    if (r) { r.step = 0; if (r.ctx) r.nextTime = r.ctx.currentTime + 0.1; }
+  }, [restartSignal]);
+
   const onPick = (e) => {
     const f = e.target.files && e.target.files[0];
     e.target.value = '';
     if (!f) return;
     const url = URL.createObjectURL(f);
     idbSave(f, f.name).catch(() => {});
+
+    // 1) Clear whatever is playing right now — stop the synth scheduler and
+    //    silence the old custom track — before the new one starts.
+    const r = R.current;
+    if (r && r.ctx) {
+      try {
+        r.master.gain.cancelScheduledValues(r.ctx.currentTime);
+        r.master.gain.setTargetAtTime(0, r.ctx.currentTime, 0.05);
+        if (r.interval) { clearInterval(r.interval); r.interval = null; }
+      } catch (err) {}
+    }
+    const a = audioRef.current;
+    if (a) { try { a.pause(); } catch (err) {} }
+
     setTrackUrl((old) => { if (old) URL.revokeObjectURL(old); return url; });
     setTrackName(f.name);
     setMuted(false); // they just chose a song — they want to hear it
-    // Kick off playback right here, inside the click/file-pick gesture, so the
-    // browser allows it. The effect-driven play() runs too late to count as a
-    // user gesture, which is why sound only started after clicking the speaker.
-    const a = audioRef.current;
+
+    // 2) Start the new track from 0 right here, inside the file-pick gesture, so
+    //    the browser allows it (a deferred effect play() counts as no gesture,
+    //    which is why sound used to need a manual speaker click).
     if (a) {
       try {
         a.src = url; a.muted = false; a.volume = volume; a.currentTime = 0;
@@ -907,6 +947,7 @@ function BeachMusic() {
       } catch (err) {}
     }
     wantPlayRef.current = true;
+    // 3) Run the pictures from the beginning too.
     restartFromStart();
   };
   const clearTrack = () => {
@@ -1329,12 +1370,15 @@ function BeachTrip() {
   const [urls, setUrls] = React.useState({});     // imgKey -> objectURL
   const [editing, setEditing] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
-  const [stageKey, setStageKey] = React.useState(0); // bump to remount Stage from the start
+  const [restartSignal, setRestartSignal] = React.useState(0);
 
-  // Replay the video from the beginning (used whenever the set of images changes)
+  // Replay from the beginning whenever the set of images/clips changes.
+  // We bump a signal the Stage watches (imperative seek-to-0 + play) instead of
+  // remounting the Stage — remounting tore down the live music element, which is
+  // what caused the soundtrack to go silent / need a manual click after edits.
   const restartFromStart = () => {
     try { localStorage.setItem('beachtrip:t', '0'); } catch (e) {}
-    setStageKey((k) => k + 1);
+    setRestartSignal((n) => n + 1);
   };
 
   // Load saved project (or defaults) + resolve uploaded image blobs to URLs
@@ -1426,7 +1470,7 @@ function BeachTrip() {
     <EditContext.Provider value={{ editing }}>
       <div style={{ position: 'absolute', inset: 0 }}>
         <PreloadGate srcs={photoSrcs}>
-          <Stage key={stageKey} width={1600} height={900} duration={total} background="#06121a" persistKey="beachtrip">
+          <Stage restartSignal={restartSignal} width={1600} height={900} duration={total} background="#06121a" persistKey="beachtrip">
             {items.map((it, i) => (
               <Sprite key={it.id} start={it.start} end={it.end}>
                 {it.type === 'title'
