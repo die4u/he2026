@@ -884,7 +884,11 @@ function BeachMusic() {
   React.useEffect(() => {
     let url = null;
     idbLoad().then((rec) => {
-      if (rec && rec.blob) { url = URL.createObjectURL(rec.blob); setTrackUrl(url); setTrackName(rec.name || 'Nhạc của bạn'); }
+      if (rec && rec.blob) {
+        url = URL.createObjectURL(rec.blob);
+        setTrackUrl(url); setTrackName(rec.name || 'Nhạc của bạn');
+        const a = audioRef.current; if (a) { try { a.src = url; } catch (e) {} }
+      }
     }).catch(() => {});
     return () => { if (url) URL.revokeObjectURL(url); };
   }, []);
@@ -1067,6 +1071,13 @@ function BeachMusic() {
         if (r.interval) { clearInterval(r.interval); r.interval = null; }
       }
       if (a) {
+        // The <audio> src is managed imperatively (never as a React prop), so a
+        // re-render can't reassign it and abort an in-flight play() — that was
+        // why a SECOND track change went silent.
+        if (trackUrl && a.getAttribute('src') !== trackUrl) {
+          a.src = trackUrl;
+          try { a.currentTime = 0; } catch (e) {}
+        }
         a.muted = muted;
         a.volume = volume;
         if (playing) {
@@ -1094,7 +1105,7 @@ function BeachMusic() {
         if (r.interval) { clearInterval(r.interval); r.interval = null; }
       }
     }
-  }, [playing, muted, hasCustom]);
+  }, [playing, muted, hasCustom, trackUrl]);
 
   // Volume is its own effect so dragging the slider only adjusts the level —
   // it never re-seeks or restarts the audio (which made changes inaudible).
@@ -1123,7 +1134,7 @@ function BeachMusic() {
 
   return (
     <div style={{ position: 'absolute', top: 24, right: 24, zIndex: 30, display: 'flex', alignItems: 'center', gap: 10 }}>
-      <audio ref={audioRef} src={trackUrl || undefined} loop preload="auto" />
+      <audio ref={audioRef} loop preload="auto" />
       <input ref={fileInputRef} type="file" accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.flac,.opus,.weba" onChange={onPick} style={{ display: 'none' }} />
 
       {hasCustom && (
