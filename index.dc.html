@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<template id="__bundler_thumbnail">
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <rect width="100" height="100" fill="#0e4257"/>
+  <circle cx="50" cy="38" r="14" fill="#5fb6c4"/>
+  <path d="M22 74c6-12 16-18 28-18s22 6 28 18z" fill="#5fb6c4"/>
+</svg>
+</template>
+<x-dc>
+<helmet>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    html, body { margin: 0; height: 100%; background: #06121a; overflow: hidden; }
+  </style>
+</helmet>
+<div style="position: fixed; inset: 0; background: #06121a;">
+  <x-import component-from-global-scope="BeachTripApp" from="./beach-trip-video.jsx" hint-size="100%,100%"></x-import>
+</div>
+</x-dc>
+</body>
+</html>

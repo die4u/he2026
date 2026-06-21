@@ -1427,7 +1427,7 @@ function EditorPanel({ clips, urls, onUpdate, onRemove, onMove, onAddPhotos, onI
   );
 }
 
-function BeachTrip() {
+function BeachTrip({ canEdit = true } = {}) {
   const OVERLAP = 0.5;
   const [clips, setClips] = React.useState(null); // null = loading from store
   const [urls, setUrls] = React.useState({});     // imgKey -> objectURL
@@ -1617,7 +1617,7 @@ function BeachTrip() {
           </button>
         )}
 
-        {!editing && (
+        {!editing && canEdit && (
           <button onClick={() => setEditing(true)} title="Chỉnh sửa ảnh & lời" style={{ position: 'absolute', top: 24, left: 24, zIndex: 40, height: 52, padding: '0 20px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.25)', background: 'rgba(8,18,26,0.42)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 9, fontFamily: VFONT, fontSize: 15, fontWeight: 700, boxShadow: '0 4px 18px rgba(0,0,0,0.3)' }}>
             <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
             Chỉnh sửa
@@ -1632,7 +1632,7 @@ function BeachTrip() {
           </div>
         )}
 
-        {editing && (
+        {editing && canEdit && (
           <EditorPanel
             clips={clips} urls={urls} busy={busy}
             onUpdate={onUpdate} onRemove={onRemove} onMove={onMove}
@@ -1648,4 +1648,421 @@ function BeachTrip() {
 }
 
 window.BeachTrip = BeachTrip;
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ĐĂNG NHẬP (Firebase Auth · Google) + PHÊ DUYỆT (Firestore)
+//  Sửa cấu hình ở FIREBASE_CONFIG / ADMIN_EMAIL nếu cần.
+// ════════════════════════════════════════════════════════════════════════════
+const ADMIN_EMAIL = 'lqdieu1981@gmail.com';
+// Chế độ "đăng nhập thử" (mock) tự TẮT khi chạy trên domain production thật,
+// và tự BẬT khi xem trước / localhost. Thêm domain thật của bạn vào đây nếu dùng tên miền riêng.
+const PROD_HOSTS = ['die4u.github.io', 'slideimages-ef18f.web.app', 'slideimages-ef18f.firebaseapp.com'];
+const ALLOW_MOCK_LOGIN = (typeof location === 'undefined') ? true : !PROD_HOSTS.includes(location.hostname);
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyA5TOwFw2vvwfsXF7p3_-8imN64j4cULf8",
+  authDomain: "slideimages-ef18f.firebaseapp.com",
+  projectId: "slideimages-ef18f",
+  storageBucket: "slideimages-ef18f.firebasestorage.app",
+  messagingSenderId: "592591735292",
+  appId: "1:592591735292:web:737d52f0b0ea8f51668a79",
+  measurementId: "G-E313P3NG1J"
+};
+const FB_VER = '10.12.5';
+const IDENT_KEY = 'beachtrip_identity_v1';
+
+function _injectScript(src) {
+  return new Promise((res, rej) => {
+    if ([].some.call(document.scripts, (s) => s.src === src)) { res(); return; }
+    const s = document.createElement('script');
+    s.src = src; s.async = false;
+    s.onload = () => res();
+    s.onerror = () => rej(new Error('Không tải được ' + src));
+    document.head.appendChild(s);
+  });
+}
+let _fbReady = null;
+function loadFirebase() {
+  if (_fbReady) return _fbReady;
+  _fbReady = (async () => {
+    const base = 'https://www.gstatic.com/firebasejs/' + FB_VER + '/';
+    if (!window.firebase) await _injectScript(base + 'firebase-app-compat.js');
+    if (!window.firebase.auth) await _injectScript(base + 'firebase-auth-compat.js');
+    if (!window.firebase.firestore) await _injectScript(base + 'firebase-firestore-compat.js');
+    if (!window.firebase.apps.length) window.firebase.initializeApp(FIREBASE_CONFIG);
+    return { fb: window.firebase, auth: window.firebase.auth(), db: window.firebase.firestore() };
+  })();
+  return _fbReady;
+}
+const _sanitize = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+const _isAdminEmail = (e) => !!e && e.toLowerCase() === ADMIN_EMAIL.toLowerCase();
+const _saveIdent = (id) => { try { localStorage.setItem(IDENT_KEY, JSON.stringify(id)); } catch (e) {} };
+const _loadIdent = () => { try { return JSON.parse(localStorage.getItem(IDENT_KEY) || 'null'); } catch (e) { return null; } };
+const _clearIdent = () => { try { localStorage.removeItem(IDENT_KEY); } catch (e) {} };
+
+const ROLE_LABEL = { viewer: 'Quyền xem', editor: 'Xem + Sửa kịch bản' };
+const STATUS_META = {
+  pending:  { label: 'Chờ duyệt',  color: '#d99a2b', bg: 'rgba(217,154,43,0.16)' },
+  approved: { label: 'Đã duyệt',   color: '#2bb3a3', bg: 'rgba(43,179,163,0.16)' },
+  rejected: { label: 'Từ chối',    color: '#d97064', bg: 'rgba(217,112,100,0.16)' },
+};
+const SCREEN_BG = 'radial-gradient(120% 120% at 50% 0%, #0e4257 0%, #08222e 55%, #05141c 100%)';
+
+function GoogleG({ size = 20 }) {
+  return React.createElement('svg', { width: size, height: size, viewBox: '0 0 48 48' },
+    React.createElement('path', { fill: '#FFC107', d: 'M43.6 20.5H42V20H24v8h11.3c-1.6 4.7-6.1 8-11.3 8a12 12 0 1 1 7.9-21l5.7-5.7A20 20 0 1 0 24 44a20 20 0 0 0 19.6-23.5z' }),
+    React.createElement('path', { fill: '#FF3D00', d: 'M6.3 14.7l6.6 4.8A12 12 0 0 1 24 12c3 0 5.8 1.2 7.9 3l5.7-5.7A20 20 0 0 0 6.3 14.7z' }),
+    React.createElement('path', { fill: '#4CAF50', d: 'M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2A12 12 0 0 1 12.7 28l-6.5 5A20 20 0 0 0 24 44z' }),
+    React.createElement('path', { fill: '#1976D2', d: 'M43.6 20.5H42V20H24v8h11.3a12 12 0 0 1-4.1 5.6l6.2 5.2C39.9 36 44 30.5 44 24c0-1.2-.1-2.4-.4-3.5z' })
+  );
+}
+
+function Avatar({ name, photo, size = 36 }) {
+  const initial = (name || '?').trim().charAt(0).toUpperCase();
+  const ring = { width: size, height: size, borderRadius: 999, flexShrink: 0, overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'linear-gradient(150deg,#13889a,#0c5566)', color: '#fff', fontFamily: VFONT, fontWeight: 800, fontSize: size * 0.42 };
+  if (photo) return React.createElement('img', { src: photo, referrerPolicy: 'no-referrer', style: Object.assign({}, ring, { objectFit: 'cover' }) });
+  return React.createElement('div', { style: ring }, initial);
+}
+
+function BeachTripApp() {
+  const [phase, setPhase] = React.useState('loading'); // loading | signin | pending | rejected | app | error
+  const [me, setMe] = React.useState(null);
+  const [busy, setBusy] = React.useState(false);
+  const [loginErr, setLoginErr] = React.useState('');
+  const [showMock, setShowMock] = React.useState(false);
+  const [mockEmail, setMockEmail] = React.useState('');
+  const [mockName, setMockName] = React.useState('');
+  const [accountOpen, setAccountOpen] = React.useState(false);
+  const [adminOpen, setAdminOpen] = React.useState(false);
+  const docUnsub = React.useRef(null);
+
+  const startSession = React.useCallback(async (id) => {
+    try {
+      setPhase('loading');
+      const { db, fb } = await loadFirebase();
+      const ref = db.collection('users').doc(id.uid);
+      const snap = await ref.get();
+      const admin = _isAdminEmail(id.email);
+      const ts = fb.firestore.FieldValue.serverTimestamp();
+      if (!snap.exists) {
+        await ref.set({
+          email: id.email || '', displayName: id.displayName || id.email || '', photoURL: id.photoURL || '',
+          role: admin ? 'editor' : 'viewer', status: admin ? 'approved' : 'pending',
+          isAdmin: admin, mock: !!id.mock, createdAt: ts, updatedAt: ts,
+        });
+      } else {
+        const patch = { email: id.email || '', displayName: id.displayName || snap.data().displayName || '', photoURL: id.photoURL || snap.data().photoURL || '' };
+        if (admin) { patch.role = 'editor'; patch.status = 'approved'; patch.isAdmin = true; }
+        await ref.update(patch);
+      }
+      if (docUnsub.current) docUnsub.current();
+      docUnsub.current = ref.onSnapshot((s) => {
+        if (!s.exists) { setPhase('signin'); return; }
+        const d = s.data();
+        setMe(Object.assign({ uid: id.uid }, d));
+        setPhase(d.status === 'approved' ? 'app' : d.status === 'rejected' ? 'rejected' : 'pending');
+      });
+    } catch (e) {
+      setLoginErr('Lỗi kết nối Firestore: ' + (e && e.message ? e.message : e) + '. Kiểm tra Rules cho phép đọc/ghi collection "users".');
+      setPhase('error');
+    }
+  }, []);
+
+  React.useEffect(() => {
+    let alive = true; let unsubAuth = null;
+    loadFirebase().then(({ auth }) => {
+      unsubAuth = auth.onAuthStateChanged((u) => {
+        if (!alive) return;
+        if (u) {
+          const id = { uid: u.uid, email: u.email, displayName: u.displayName, photoURL: u.photoURL, mock: false };
+          _saveIdent(id); startSession(id);
+        } else {
+          const m = _loadIdent();
+          if (m && m.mock) startSession(m);
+          else setPhase('signin');
+        }
+      });
+    }).catch((e) => {
+      setLoginErr('Không tải được Firebase SDK: ' + (e && e.message ? e.message : e));
+      setPhase('error');
+    });
+    return () => { alive = false; if (unsubAuth) unsubAuth(); if (docUnsub.current) docUnsub.current(); };
+  }, [startSession]);
+
+  const signInGoogle = async () => {
+    setLoginErr(''); setBusy(true);
+    try {
+      const { auth, fb } = await loadFirebase();
+      const provider = new fb.auth.GoogleAuthProvider();
+      await auth.signInWithPopup(provider); // onAuthStateChanged tiếp quản
+    } catch (e) {
+      setBusy(false);
+      const code = (e && e.code) || '';
+      if (code.indexOf('unauthorized-domain') >= 0) {
+        setLoginErr('Tên miền xem trước chưa được Firebase cấp phép. Hãy dùng “Đăng nhập thử” bên dưới để xem luồng, hoặc thêm domain vào Authentication → Settings → Authorized domains khi deploy.');
+      } else if (code.indexOf('popup') >= 0) {
+        setLoginErr('Cửa sổ Google bị chặn trong khung xem trước. Hãy dùng “Đăng nhập thử” bên dưới.');
+      } else {
+        setLoginErr('Không đăng nhập được: ' + (e && e.message ? e.message : e));
+      }
+      if (ALLOW_MOCK_LOGIN) setShowMock(true);
+    }
+  };
+
+  const signInMock = () => {
+    const email = (mockEmail || '').trim();
+    if (!email || email.indexOf('@') < 1) { setLoginErr('Vui lòng nhập email hợp lệ.'); return; }
+    setLoginErr('');
+    const id = { uid: 'mock_' + _sanitize(email), email, displayName: (mockName || '').trim() || email.split('@')[0], photoURL: '', mock: true };
+    _saveIdent(id); startSession(id);
+  };
+
+  const doSignOut = async () => {
+    setAccountOpen(false); setAdminOpen(false);
+    if (docUnsub.current) { docUnsub.current(); docUnsub.current = null; }
+    try { const { auth } = await loadFirebase(); await auth.signOut(); } catch (e) {}
+    _clearIdent(); setMe(null); setPhase('signin');
+  };
+
+  // ── chrome chung cho các màn full-screen ───────────────────────────────────
+  const Centered = ({ children }) => React.createElement('div', {
+    style: { position: 'absolute', inset: 0, background: SCREEN_BG, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24, fontFamily: VFONT, boxSizing: 'border-box' }
+  }, children);
+
+  if (phase === 'loading') {
+    return React.createElement(Centered, null,
+      React.createElement('div', { style: { color: 'rgba(255,255,255,0.92)', fontWeight: 700, fontSize: 22 } }, 'Đang tải…'));
+  }
+
+  if (phase === 'error') {
+    return React.createElement(Centered, null,
+      React.createElement('div', { style: { maxWidth: 460, textAlign: 'center', color: '#fff' } },
+        React.createElement('div', { style: { fontWeight: 800, fontSize: 24, marginBottom: 12 } }, 'Có lỗi xảy ra'),
+        React.createElement('div', { style: { fontSize: 15, lineHeight: 1.6, color: 'rgba(255,255,255,0.8)', marginBottom: 20 } }, loginErr),
+        React.createElement('button', { onClick: () => { setPhase('signin'); setLoginErr(''); }, style: btnGhost }, 'Quay lại')));
+  }
+
+  if (phase === 'signin') return renderSignin();
+  if (phase === 'pending') return renderStatus('pending');
+  if (phase === 'rejected') return renderStatus('rejected');
+
+  // phase === 'app'
+  const canEdit = !!me && (me.isAdmin || me.role === 'editor');
+  return React.createElement('div', { style: { position: 'absolute', inset: 0, background: '#06121a' } },
+    React.createElement(BeachTrip, { canEdit }),
+    renderAccountChip(),
+    adminOpen && me && me.isAdmin ? React.createElement(AdminPanel, { meUid: me.uid, onClose: () => setAdminOpen(false) }) : null
+  );
+
+  // ── render helpers ──────────────────────────────────────────────────────────
+  function renderSignin() {
+    return React.createElement(Centered, null,
+      React.createElement('div', { style: cardStyle },
+        React.createElement('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, marginBottom: 26 } },
+          React.createElement('div', { style: { fontSize: 13, fontWeight: 700, letterSpacing: '0.18em', textTransform: 'uppercase', color: '#5fb6c4' } }, 'Chuyến đi biển'),
+          React.createElement('div', { style: { fontSize: 27, fontWeight: 800, color: '#0e3a49', letterSpacing: '-0.02em', textAlign: 'center' } }, 'Đăng nhập để xem video'),
+          React.createElement('div', { style: { fontSize: 14.5, fontWeight: 500, color: '#6b8893', textAlign: 'center', lineHeight: 1.55 } }, 'Tài khoản cần được quản trị viên phê duyệt trước khi truy cập.')
+        ),
+        React.createElement('button', { onClick: signInGoogle, disabled: busy, style: btnGoogle },
+          React.createElement(GoogleG, { size: 21 }),
+          React.createElement('span', null, busy ? 'Đang mở Google…' : 'Đăng nhập bằng Google')),
+        loginErr ? React.createElement('div', { style: errBox }, loginErr) : null,
+        ALLOW_MOCK_LOGIN ? React.createElement(React.Fragment, null,
+          React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12, margin: '20px 0 4px' } },
+            React.createElement('div', { style: { flex: 1, height: 1, background: '#e0e8eb' } }),
+            React.createElement('div', { style: { fontSize: 12, fontWeight: 700, color: '#9bb0b8', letterSpacing: '0.08em' } }, showMock ? 'ĐĂNG NHẬP THỬ' : 'HOẶC'),
+            React.createElement('div', { style: { flex: 1, height: 1, background: '#e0e8eb' } })),
+          showMock
+            ? React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 9, marginTop: 12 } },
+                React.createElement('div', { style: { fontSize: 12.5, color: '#7d949d', lineHeight: 1.5 } }, 'Chế độ thử (không cần popup Google) — nhập email để mô phỏng người dùng. Quyền vẫn được lưu thật trên Firestore.'),
+                React.createElement('input', { value: mockEmail, onChange: (e) => setMockEmail(e.target.value), placeholder: 'email@gmail.com', onKeyDown: (e) => { if (e.key === 'Enter') signInMock(); }, style: inputStyle2 }),
+                React.createElement('input', { value: mockName, onChange: (e) => setMockName(e.target.value), placeholder: 'Tên hiển thị (tuỳ chọn)', style: inputStyle2 }),
+                React.createElement('button', { onClick: signInMock, style: btnPrimary }, 'Vào thử'))
+            : React.createElement('button', { onClick: () => setShowMock(true), style: { ...btnGhost, marginTop: 12 } }, 'Đăng nhập thử (xem trước luồng)')
+        ) : null
+      ));
+  }
+
+  function renderStatus(kind) {
+    const isPending = kind === 'pending';
+    const m = STATUS_META[kind];
+    return React.createElement(Centered, null,
+      React.createElement('div', { style: { ...cardStyle, textAlign: 'center' } },
+        me ? React.createElement('div', { style: { display: 'flex', justifyContent: 'center', marginBottom: 16 } }, React.createElement(Avatar, { name: me.displayName, photo: me.photoURL, size: 56 })) : null,
+        React.createElement('div', { style: { display: 'inline-flex', alignItems: 'center', gap: 7, alignSelf: 'center', padding: '5px 13px', borderRadius: 999, background: m.bg, color: m.color, fontSize: 13, fontWeight: 800, marginBottom: 14 } },
+          React.createElement('span', { style: { width: 8, height: 8, borderRadius: 999, background: m.color } }), m.label),
+        React.createElement('div', { style: { fontSize: 23, fontWeight: 800, color: '#0e3a49', marginBottom: 10 } }, isPending ? 'Đang chờ phê duyệt' : 'Truy cập bị từ chối'),
+        React.createElement('div', { style: { fontSize: 15, color: '#6b8893', lineHeight: 1.6, marginBottom: 22 } },
+          isPending
+            ? 'Tài khoản của bạn đã được ghi nhận. Quản trị viên sẽ phê duyệt và cấp quyền. Trang sẽ tự mở khi được duyệt.'
+            : 'Tài khoản của bạn chưa được cấp quyền truy cập. Vui lòng liên hệ quản trị viên.'),
+        me ? React.createElement('div', { style: { fontSize: 13.5, color: '#9bb0b8', marginBottom: 22 } }, me.email) : null,
+        React.createElement('button', { onClick: doSignOut, style: btnGhost }, 'Đăng xuất')));
+  }
+
+  function renderAccountChip() {
+    if (!me) return null;
+    const role = me.isAdmin ? 'editor' : me.role;
+    return React.createElement('div', { style: { position: 'absolute', top: 24, right: 88, zIndex: 45, fontFamily: VFONT } },
+      React.createElement('button', { onClick: () => setAccountOpen((v) => !v), title: 'Tài khoản', style: { display: 'flex', alignItems: 'center', gap: 9, height: 52, padding: '0 14px 0 8px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.25)', background: 'rgba(8,18,26,0.42)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)', color: '#fff', cursor: 'pointer', boxShadow: '0 4px 18px rgba(0,0,0,0.3)' } },
+        React.createElement(Avatar, { name: me.displayName, photo: me.photoURL, size: 36 }),
+        React.createElement('span', { style: { fontSize: 14.5, fontWeight: 700, maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, me.displayName || me.email)),
+      accountOpen ? React.createElement('div', { style: { position: 'absolute', top: 60, right: 0, width: 248, background: '#fff', borderRadius: 14, boxShadow: '0 18px 50px rgba(0,0,0,0.35)', overflow: 'hidden' } },
+        React.createElement('div', { style: { padding: '15px 16px', borderBottom: '1px solid #eef2f3' } },
+          React.createElement('div', { style: { fontSize: 15, fontWeight: 800, color: '#13303c', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, me.displayName || '—'),
+          React.createElement('div', { style: { fontSize: 13, color: '#7d949d', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1 } }, me.email),
+          React.createElement('div', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, marginTop: 9, padding: '4px 10px', borderRadius: 999, background: '#e7f3f4', color: '#0c6d7e', fontSize: 12, fontWeight: 800 } }, ROLE_LABEL[role] || role, me.isAdmin ? ' · Admin' : '')),
+        me.isAdmin ? React.createElement('button', { onClick: () => { setAccountOpen(false); setAdminOpen(true); }, style: menuItem },
+          React.createElement('svg', { width: 17, height: 17, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' }, React.createElement('path', { d: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2' }), React.createElement('circle', { cx: 9, cy: 7, r: 4 }), React.createElement('path', { d: 'M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75' })),
+          'Trang duyệt người dùng') : null,
+        React.createElement('button', { onClick: doSignOut, style: { ...menuItem, color: '#c0504d' } },
+          React.createElement('svg', { width: 17, height: 17, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' }, React.createElement('path', { d: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4' }), React.createElement('polyline', { points: '16 17 21 12 16 7' }), React.createElement('line', { x1: 21, y1: 12, x2: 9, y2: 12 })),
+          'Đăng xuất')) : null);
+  }
+}
+
+// ── Trang Admin: danh sách user + duyệt/quyền ─────────────────────────────────
+function AdminPanel({ meUid, onClose }) {
+  const [users, setUsers] = React.useState(null);
+  const [archive, setArchive] = React.useState(null); // kho email bị từ chối
+  const [filter, setFilter] = React.useState('all'); // all | pending | approved | rejected | archive
+  React.useEffect(() => {
+    let unsub = null; let alive = true;
+    loadFirebase().then(({ db }) => {
+      unsub = db.collection('users').onSnapshot((qs) => {
+        if (!alive) return;
+        const arr = qs.docs.map((d) => Object.assign({ uid: d.id }, d.data()));
+        arr.sort((a, b) => {
+          const ord = { pending: 0, approved: 1, rejected: 2 };
+          if ((ord[a.status] ?? 9) !== (ord[b.status] ?? 9)) return (ord[a.status] ?? 9) - (ord[b.status] ?? 9);
+          return (a.email || '').localeCompare(b.email || '');
+        });
+        setUsers(arr);
+      }, () => setUsers([]));
+    });
+    return () => { alive = false; if (unsub) unsub(); };
+  }, []);
+
+  React.useEffect(() => {
+    let unsub = null; let alive = true;
+    loadFirebase().then(({ db }) => {
+      unsub = db.collection('rejectedEmails').onSnapshot((qs) => {
+        if (!alive) return;
+        const arr = qs.docs.map((d) => Object.assign({ id: d.id }, d.data()));
+        arr.sort((a, b) => (a.email || '').localeCompare(b.email || ''));
+        setArchive(arr);
+      }, () => setArchive([]));
+    });
+    return () => { alive = false; if (unsub) unsub(); };
+  }, []);
+
+  const patch = async (uid, data) => {
+    const { db, fb } = await loadFirebase();
+    await db.collection('users').doc(uid).update(Object.assign({ updatedAt: fb.firestore.FieldValue.serverTimestamp() }, data));
+  };
+  const reject = async (u) => {
+    const { db, fb } = await loadFirebase();
+    const ts = fb.firestore.FieldValue.serverTimestamp();
+    await db.collection('users').doc(u.uid).update({ status: 'rejected', updatedAt: ts });
+    if (u.email) await db.collection('rejectedEmails').doc(_sanitize(u.email)).set({ email: u.email, displayName: u.displayName || '', photoURL: u.photoURL || '', rejectedAt: ts }, { merge: true });
+  };
+  const remove = async (uid, label) => {
+    if (!window.confirm('Xoá tài khoản "' + (label || uid) + '"?\nNgười này có thể đăng nhập lại để chờ duyệt từ đầu.')) return;
+    const { db } = await loadFirebase();
+    await db.collection('users').doc(uid).delete();
+  };
+  const removeArchive = async (id, label) => {
+    if (!window.confirm('Xoá "' + (label || id) + '" khỏi kho lưu trữ email từ chối?')) return;
+    const { db } = await loadFirebase();
+    await db.collection('rejectedEmails').doc(id).delete();
+  };
+
+  const list = (users || []).filter((u) => filter === 'all' || u.status === filter);
+  const counts = (users || []).reduce((a, u) => { a[u.status] = (a[u.status] || 0) + 1; return a; }, {});
+  const archiveList = archive || [];
+
+  const tab = (key, label) => React.createElement('button', { key, onClick: () => setFilter(key), style: { fontFamily: VFONT, fontSize: 13.5, fontWeight: 700, padding: '7px 14px', borderRadius: 999, border: 'none', cursor: 'pointer', background: filter === key ? '#0c6d7e' : '#eef3f4', color: filter === key ? '#fff' : '#5a7682' } },
+    label + (key !== 'all' && counts[key] ? ' · ' + counts[key] : ''));
+
+  return React.createElement('div', { style: { position: 'absolute', inset: 0, zIndex: 9999, background: 'rgba(5,18,26,0.72)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24, fontFamily: VFONT, boxSizing: 'border-box' } },
+    React.createElement('div', { style: { width: 760, maxWidth: '100%', maxHeight: '90%', background: '#f4f7f8', borderRadius: 18, overflow: 'hidden', display: 'flex', flexDirection: 'column', boxShadow: '0 30px 80px rgba(0,0,0,0.5)' } },
+      React.createElement('div', { style: { padding: '20px 24px', background: '#0e4257', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
+        React.createElement('div', null,
+          React.createElement('div', { style: { fontSize: 20, fontWeight: 800 } }, 'Duyệt người dùng'),
+          React.createElement('div', { style: { fontSize: 13.5, color: 'rgba(255,255,255,0.72)', marginTop: 2 } }, (users ? users.length : 0) + ' tài khoản · ' + (counts.pending || 0) + ' chờ duyệt')),
+        React.createElement('button', { onClick: onClose, style: { width: 38, height: 38, borderRadius: 999, border: 'none', background: 'rgba(255,255,255,0.16)', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' } },
+          React.createElement('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2.4, strokeLinecap: 'round' }, React.createElement('line', { x1: 6, y1: 6, x2: 18, y2: 18 }), React.createElement('line', { x1: 18, y1: 6, x2: 6, y2: 18 })))),
+      React.createElement('div', { style: { padding: '14px 24px', display: 'flex', gap: 8, borderBottom: '1px solid #e3eaec', background: '#fff' } },
+        tab('all', 'Tất cả'), tab('pending', 'Chờ duyệt'), tab('approved', 'Đã duyệt'), tab('rejected', 'Từ chối'),
+        React.createElement('div', { style: { flex: 1 } }),
+        React.createElement('button', { onClick: () => setFilter('archive'), style: { fontFamily: VFONT, fontSize: 13.5, fontWeight: 700, padding: '7px 14px', borderRadius: 999, border: 'none', cursor: 'pointer', background: filter === 'archive' ? '#5a3a4a' : '#f1e6ea', color: filter === 'archive' ? '#fff' : '#a05a72' } }, 'Kho từ chối' + (archiveList.length ? ' · ' + archiveList.length : ''))),
+      React.createElement('div', { style: { padding: 16, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10 } },
+        filter === 'archive'
+          ? (archive === null
+              ? React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#8aa0a8', fontWeight: 600 } }, 'Đang tải kho…')
+              : archiveList.length === 0
+                ? React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#8aa0a8', fontWeight: 600 } }, 'Chưa có email từ chối nào được lưu.')
+                : [React.createElement('div', { key: '_hint', style: { fontSize: 12.5, color: '#9bb0b8', fontWeight: 600, padding: '0 4px 2px', lineHeight: 1.5 } }, 'Email đã từng bị từ chối — lưu độc lập, giữ lại kể cả khi đã xoá tài khoản.')].concat(
+                    archiveList.map((a) => React.createElement('div', { key: a.id, style: { background: '#fff', border: '1px solid #e6edef', borderRadius: 13, padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 12 } },
+                      React.createElement(Avatar, { name: a.displayName || a.email, photo: a.photoURL, size: 38 }),
+                      React.createElement('div', { style: { flex: 1, minWidth: 0 } },
+                        React.createElement('div', { style: { fontSize: 15, fontWeight: 800, color: '#13303c', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, a.email),
+                        a.displayName ? React.createElement('div', { style: { fontSize: 13, color: '#7d949d', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1 } }, a.displayName) : null),
+                      React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 11px', borderRadius: 999, background: STATUS_META.rejected.bg, color: STATUS_META.rejected.color, fontSize: 12.5, fontWeight: 800, flexShrink: 0 } },
+                        React.createElement('span', { style: { width: 7, height: 7, borderRadius: 999, background: STATUS_META.rejected.color } }), 'Từ chối'),
+                      React.createElement('button', { onClick: () => removeArchive(a.id, a.email), title: 'Xoá khỏi kho', style: { display: 'flex', alignItems: 'center', justifyContent: 'center', width: 38, height: 38, borderRadius: 9, border: '1px solid #f0dad6', background: '#fff', color: '#c0504d', cursor: 'pointer', flexShrink: 0 } },
+                        React.createElement('svg', { width: 17, height: 17, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' }, React.createElement('polyline', { points: '3 6 5 6 21 6' }), React.createElement('path', { d: 'M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2' }), React.createElement('line', { x1: 10, y1: 11, x2: 10, y2: 17 }), React.createElement('line', { x1: 14, y1: 11, x2: 14, y2: 17 }))))))
+            )
+          : users === null
+            ? React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#8aa0a8', fontWeight: 600 } }, 'Đang tải danh sách…')
+            : list.length === 0
+              ? React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#8aa0a8', fontWeight: 600 } }, 'Không có tài khoản nào.')
+              : list.map((u) => React.createElement(AdminRow, { key: u.uid, u, isSelf: u.uid === meUid, patch, reject, remove }))
+      )));
+}
+
+function AdminRow({ u, isSelf, patch, reject, remove }) {
+  const sm = STATUS_META[u.status] || STATUS_META.pending;
+  const roleBtn = (key, label) => React.createElement('button', {
+    key, disabled: u.isAdmin, onClick: () => patch(u.uid, { role: key }),
+    style: { fontFamily: VFONT, fontSize: 12.5, fontWeight: 700, padding: '6px 11px', borderRadius: 8, cursor: u.isAdmin ? 'default' : 'pointer', border: '1px solid ' + (u.role === key ? '#0c6d7e' : '#d4dde2'), background: u.role === key ? '#0c6d7e' : '#fff', color: u.role === key ? '#fff' : '#5a7682', opacity: u.isAdmin ? 0.5 : 1 }
+  }, label);
+  const actBtn = (label, onClick, kind) => React.createElement('button', { onClick, style: { fontFamily: VFONT, fontSize: 13, fontWeight: 700, padding: '8px 14px', borderRadius: 9, border: 'none', cursor: 'pointer', background: kind === 'approve' ? '#0c6d7e' : kind === 'reject' ? '#f3e2e0' : '#eef3f4', color: kind === 'approve' ? '#fff' : kind === 'reject' ? '#c0504d' : '#5a7682' } }, label);
+
+  return React.createElement('div', { style: { background: '#fff', border: '1px solid #e6edef', borderRadius: 13, padding: 14, display: 'flex', flexDirection: 'column', gap: 12 } },
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12 } },
+      React.createElement(Avatar, { name: u.displayName, photo: u.photoURL, size: 42 }),
+      React.createElement('div', { style: { flex: 1, minWidth: 0 } },
+        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+          React.createElement('span', { style: { fontSize: 15.5, fontWeight: 800, color: '#13303c', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, u.displayName || u.email),
+          u.isAdmin ? React.createElement('span', { style: { fontSize: 11, fontWeight: 800, color: '#b4632a', background: '#fbeadd', padding: '2px 8px', borderRadius: 999 } }, 'ADMIN') : null,
+          u.mock ? React.createElement('span', { style: { fontSize: 11, fontWeight: 700, color: '#8aa0a8', background: '#eef3f4', padding: '2px 8px', borderRadius: 999 } }, 'thử') : null),
+        React.createElement('div', { style: { fontSize: 13, color: '#7d949d', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1 } }, u.email)),
+      React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 11px', borderRadius: 999, background: sm.bg, color: sm.color, fontSize: 12.5, fontWeight: 800, flexShrink: 0 } },
+        React.createElement('span', { style: { width: 7, height: 7, borderRadius: 999, background: sm.color } }), sm.label)),
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' } },
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 7 } },
+        React.createElement('span', { style: { fontSize: 11.5, fontWeight: 700, color: '#9bb0b8', letterSpacing: '0.04em', textTransform: 'uppercase' } }, 'Quyền'),
+        roleBtn('viewer', 'Xem'), roleBtn('editor', 'Xem + Kịch bản')),
+      React.createElement('div', { style: { flex: 1 } }),
+      isSelf
+        ? React.createElement('span', { style: { fontSize: 12.5, color: '#9bb0b8', fontWeight: 600 } }, 'Tài khoản của bạn')
+        : React.createElement('div', { style: { display: 'flex', gap: 8 } },
+            u.status !== 'approved' ? actBtn('Duyệt', () => patch(u.uid, { status: 'approved' }), 'approve') : null,
+            u.status !== 'rejected' ? actBtn('Từ chối', () => reject(u), 'reject') : null,
+            u.status === 'approved' ? actBtn('Thu hồi', () => patch(u.uid, { status: 'pending' }), 'neutral') : null,
+            u.status === 'rejected' ? actBtn('Mở lại', () => patch(u.uid, { status: 'pending' }), 'neutral') : null,
+            React.createElement('button', { onClick: () => remove(u.uid, u.displayName || u.email), title: 'Xoá tài khoản', style: { display: 'flex', alignItems: 'center', justifyContent: 'center', width: 38, height: 38, borderRadius: 9, border: '1px solid #f0dad6', background: '#fff', color: '#c0504d', cursor: 'pointer', flexShrink: 0 } },
+              React.createElement('svg', { width: 17, height: 17, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' }, React.createElement('polyline', { points: '3 6 5 6 21 6' }), React.createElement('path', { d: 'M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2' }), React.createElement('line', { x1: 10, y1: 11, x2: 10, y2: 17 }), React.createElement('line', { x1: 14, y1: 11, x2: 14, y2: 17 }))))));
+}
+
+// ── style tokens dùng chung cho lớp auth ─────────────────────────────────────
+const cardStyle = { width: 420, maxWidth: '100%', background: '#fff', borderRadius: 22, padding: '34px 32px', boxShadow: '0 30px 80px rgba(0,0,0,0.4)', display: 'flex', flexDirection: 'column', fontFamily: VFONT };
+const btnGoogle = { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 11, width: '100%', height: 52, borderRadius: 12, border: '1px solid #dadfe2', background: '#fff', color: '#27343a', fontFamily: VFONT, fontSize: 16, fontWeight: 700, cursor: 'pointer', boxShadow: '0 1px 2px rgba(0,0,0,0.05)' };
+const btnPrimary = { width: '100%', height: 48, borderRadius: 11, border: 'none', background: '#0c6d7e', color: '#fff', fontFamily: VFONT, fontSize: 15.5, fontWeight: 700, cursor: 'pointer' };
+const btnGhost = { width: '100%', height: 46, borderRadius: 11, border: '1px solid #d4dde2', background: '#fff', color: '#41606b', fontFamily: VFONT, fontSize: 15, fontWeight: 700, cursor: 'pointer' };
+const inputStyle2 = { width: '100%', boxSizing: 'border-box', height: 46, fontFamily: VFONT, fontSize: 15, fontWeight: 500, color: '#13303c', background: '#fff', border: '1px solid #d4dde2', borderRadius: 11, padding: '0 14px', outline: 'none' };
+const errBox = { marginTop: 14, padding: '11px 14px', background: '#fdeeec', border: '1px solid #f3d4cf', borderRadius: 11, color: '#b5483c', fontFamily: VFONT, fontSize: 13, fontWeight: 600, lineHeight: 1.5 };
+const menuItem = { display: 'flex', alignItems: 'center', gap: 11, width: '100%', padding: '13px 16px', border: 'none', background: 'transparent', color: '#3a5562', fontFamily: VFONT, fontSize: 14.5, fontWeight: 700, cursor: 'pointer', textAlign: 'left' };
+
+window.BeachTripApp = BeachTripApp;
 
