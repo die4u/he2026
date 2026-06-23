@@ -1,0 +1,50 @@
+rules_version = '2';
+
+// ════════════════════════════════════════════════════════════════════
+//  Firestore Rules — BẢN PRODUCTION (an toàn) cho Video chuyến đi biển
+//  Dán toàn bộ nội dung này vào: Firebase Console → Firestore → tab Rules → Publish
+//  Yêu cầu: người dùng phải đăng nhập Google thật (mock không ghi được — đúng ý đồ bảo mật).
+// ════════════════════════════════════════════════════════════════════
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    function isAdmin() {
+      return isSignedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email == 'lqdieu1981@gmail.com';
+    }
+    function safeSelfWrite(uid) {
+      return isSignedIn()
+        && request.auth.uid == uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.role == 'viewer'
+        && request.resource.data.isAdmin == false;
+    }
+
+    match /users/{uid} {
+      allow get:  if isSignedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin();
+
+      allow create: if isAdmin() || safeSelfWrite(uid);
+
+      allow update: if isAdmin()
+        || (isSignedIn() && request.auth.uid == uid
+            && request.resource.data.role == resource.data.role
+            && request.resource.data.status == resource.data.status
+            && request.resource.data.isAdmin == resource.data.isAdmin);
+
+      allow delete: if isAdmin();
+    }
+
+    match /rejectedEmails/{id} {
+      allow read, write: if isAdmin();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

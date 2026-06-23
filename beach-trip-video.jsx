@@ -833,8 +833,10 @@ function BeachMusic() {
     try { const v = parseFloat(localStorage.getItem('beachtrip:vol')); return isFinite(v) ? Math.min(1, Math.max(0, v)) : 0.85; } catch (e) { return 0.85; }
   });
   React.useEffect(() => { try { localStorage.setItem('beachtrip:vol', String(volume)); } catch (e) {} }, [volume]);
-  const [trackName, setTrackName] = React.useState(null); // null = built-in synth
-  const [trackUrl, setTrackUrl] = React.useState(null);
+  // Default soundtrack: the song the user provided (lives at music/yenbinh.mp3).
+  const DEFAULT_TRACK = { url: 'music/yenbinh.mp3', name: 'Yên Bình – Trịnh Thăng Bình' };
+  const [trackName, setTrackName] = React.useState(DEFAULT_TRACK.name);
+  const [trackUrl, setTrackUrl] = React.useState(DEFAULT_TRACK.url);
   const audioRef = React.useRef(null);
   const fileInputRef = React.useRef(null);
   const R = React.useRef({});
@@ -894,6 +896,10 @@ function BeachMusic() {
         url = URL.createObjectURL(rec.blob);
         setTrackUrl(url); setTrackName(rec.name || 'Nhạc của bạn');
         const a = audioRef.current; if (a) { try { a.src = url; } catch (e) {} }
+      } else {
+        // No user upload saved — fall back to the provided default track.
+        const a = audioRef.current;
+        if (a && a.getAttribute('src') !== DEFAULT_TRACK.url) { try { a.src = DEFAULT_TRACK.url; } catch (e) {} }
       }
     }).catch(() => {});
     return () => { if (url) URL.revokeObjectURL(url); };
@@ -943,7 +949,7 @@ function BeachMusic() {
     const a = audioRef.current;
     if (a) { try { a.pause(); } catch (err) {} }
 
-    setTrackUrl((old) => { if (old) URL.revokeObjectURL(old); return url; });
+    setTrackUrl((old) => { if (old && old.startsWith('blob:')) URL.revokeObjectURL(old); return url; });
     setTrackName(f.name);
     setMuted(false); // they just chose a song — they want to hear it
 
@@ -962,12 +968,16 @@ function BeachMusic() {
   };
   const clearTrack = () => {
     idbClear().catch(() => {});
-    setTrackUrl((old) => { if (old) URL.revokeObjectURL(old); return null; });
-    setTrackName(null);
+    setTrackUrl((old) => { if (old && old.startsWith('blob:')) URL.revokeObjectURL(old); return DEFAULT_TRACK.url; });
+    setTrackName(DEFAULT_TRACK.name);
     const a = audioRef.current;
-    if (a) { try { a.pause(); } catch (e) {} }
-    // Unlock/resume the synth's AudioContext within this gesture too.
-    try { const r = ensure(); if (r.ctx && r.ctx.state === 'suspended') r.ctx.resume(); } catch (e) {}
+    if (a) {
+      try {
+        a.src = DEFAULT_TRACK.url; a.muted = muted; a.volume = volume; a.currentTime = 0;
+        if (!muted) { const p = a.play(); if (p && p.then) p.catch(() => {}); }
+      } catch (e) {}
+    }
+    wantPlayRef.current = !muted;
     restartFromStart();
   };
 
@@ -1188,36 +1198,33 @@ function BeachMusic() {
 const EditContext = React.createContext({ editing: false });
 
 const DEFAULT_SEQ = [
-  { type: 'title', title: 'CHUYẾN ĐI CHƠI BIỂN', sub: 'Một ngày hè đáng nhớ của gia đình mình', dur: 3.8 },
-  { src: 'img/IMG_5718.jpeg', cap: 'Bắt đầu từ sân nhà…', dur: 3.2 },
-  { src: 'img/IMG_5717.jpeg', cap: '484 Lý Thái Tổ', dur: 3.0 },
-  { src: 'img/IMG_5715.jpeg', cap: 'Hai mẹ con lên đường', dur: 3.0 },
-  { type: 'title', title: 'RA TỚI BIỂN', dur: 2.6, variant: 'mini' },
-  { src: 'img/IMG_5710.jpeg', cap: 'Biển gọi tên mình rồi!', dur: 3.2 },
-  { src: 'img/IMG_5709.jpeg', dur: 2.8 },
-  { src: 'img/IMG_5690.jpeg', cap: 'Trời xanh, biển rộng', dur: 2.8 },
-  { src: 'img/IMG_5703.jpeg', cap: 'Tạo dáng chút nào', dur: 3.0 },
-  { src: 'img/IMG_5695.jpeg', cap: 'Nắm tay nhau ra khơi', dur: 3.2 },
-  { src: 'img/IMG_5691.jpeg', cap: 'Vui hết cỡ!', dur: 3.0 },
-  { src: 'img/IMG_5601.jpeg', cap: 'Sóng tới rồi!', dur: 2.8 },
-  { src: 'img/IMG_5595.jpeg', dur: 2.6 },
-  { src: 'img/IMG_5625.jpeg', cap: 'Cười thật tươi', dur: 3.0 },
-  { src: 'img/IMG_5618.jpeg', dur: 2.6 },
-  { src: 'img/IMG_5574.jpeg', cap: 'Cả nhà cùng nghịch nước', dur: 3.0 },
-  { type: 'title', title: 'NHỮNG ĐIỀU THÚ VỊ', dur: 2.6, variant: 'mini' },
-  { src: 'img/IMG_5671.jpeg', cap: 'Bạn cua nhỏ ghé chơi', dur: 3.0 },
-  { src: 'img/IMG_5670.jpeg', cap: 'Máy bay vút qua trời', dur: 2.8 },
-  { src: 'img/IMG_5664.jpeg', cap: 'Thuyền thúng phơi nắng', dur: 3.0 },
-  { src: 'img/IMG_5669.jpeg', cap: 'Tập bơi nào!', dur: 3.0 },
-  { type: 'title', title: 'HOÀNG HÔN', dur: 2.6, variant: 'mini' },
-  { src: 'img/IMG_5682.jpeg', cap: 'Hoàng hôn buông xuống', dur: 3.4 },
-  { src: 'img/IMG_5663.jpeg', dur: 2.8 },
-  { src: 'img/IMG_5662.jpeg', cap: 'Hoa giấy bên đường', dur: 3.0 },
-  { src: 'img/IMG_5661.jpeg', dur: 2.8 },
-  { src: 'img/IMG_5570.jpeg', cap: 'Đi cùng nhau vui hơn', dur: 3.2 },
-  { src: 'img/IMG_5569.jpeg', dur: 2.8 },
-  { src: 'img/IMG_5559.jpeg', cap: 'Một chút bình yên', dur: 3.4 },
-  { type: 'title', title: 'MÃI BÊN NHAU ♡', sub: 'Hẹn gặp lại nhé, biển ơi!', dur: 4.6, variant: 'final' },
+  { type: 'title', title: 'THỜI GIAN THƯ GIÃN', sub: 'Những khoảnh khắc chậm rãi · 2026', dur: 3.8 },
+  { src: 'img/relax_leaves.jpg', cap: 'Bắt đầu ngày mới thật nhẹ nhàng', dur: 3.2 },
+  { src: 'img/relax_tree.jpeg', cap: 'Ngẩng đầu nhìn trời xanh', dur: 3.0 },
+  { type: 'title', title: 'CÀ PHÊ SÁNG', dur: 2.6, variant: 'mini' },
+  { src: 'img/relax_cong.jpg', cap: 'Ly cà phê quen thuộc', dur: 3.2 },
+  { src: 'img/relax_icedcoffee.jpeg', dur: 2.8 },
+  { src: 'img/relax_clover.jpeg', cap: 'Một mình một góc', dur: 3.0 },
+  { src: 'img/relax_highlands.jpeg', cap: 'Highlands buổi sáng', dur: 3.0 },
+  { src: 'img/relax_orange.jpeg', cap: 'Thêm chút ngọt ngào', dur: 2.8 },
+  { src: 'img/relax_lychee.jpg', cap: 'Trà vải mát lạnh', dur: 3.0 },
+  { type: 'title', title: 'GÓC QUÁN YÊU THÍCH', dur: 2.6, variant: 'mini' },
+  { src: 'img/relax_rooftop.jpeg', cap: 'Quán trên cao, gió lộng', dur: 3.2 },
+  { src: 'img/relax_rooftop2.jpeg', dur: 2.8 },
+  { src: 'img/relax_interior.jpeg', cap: 'Ấm áp bên trong', dur: 3.0 },
+  { src: 'img/relax_window.jpeg', cap: 'Bên ô cửa xanh', dur: 2.8 },
+  { src: 'img/relax_umbrella.jpeg', cap: 'Dưới bóng ô che', dur: 3.0 },
+  { type: 'title', title: 'THIÊN NHIÊN QUANH TA', dur: 2.6, variant: 'mini' },
+  { src: 'img/relax_flowerpath.jpeg', cap: 'Lối hoa giấy', dur: 3.2 },
+  { src: 'img/relax_bougain.jpeg', dur: 2.8 },
+  { src: 'img/relax_lotus.jpeg', cap: 'Sen nhỏ tĩnh lặng', dur: 3.0 },
+  { src: 'img/relax_sunflower.jpeg', cap: 'Hướng về phía nắng', dur: 3.0 },
+  { type: 'title', title: 'BIỂN GỌI', dur: 2.6, variant: 'mini' },
+  { src: 'img/relax_boat.jpeg', cap: 'Biển xanh ngày nắng', dur: 3.4 },
+  { src: 'img/relax_waves.jpeg', dur: 2.8 },
+  { src: 'img/relax_beach.jpeg', cap: 'Chậm lại một nhịp', dur: 3.2 },
+  { src: 'img/relax_beachsky.jpeg', dur: 2.8 },
+  { type: 'title', title: 'THƯ GIÃN & TẬN HƯỞNG ♡', sub: 'Hẹn gặp lại năm sau!', dur: 4.6, variant: 'final' },
 ].map((s, i) => Object.assign({ id: 'd' + i }, s));
 
 const freshDefault = () => DEFAULT_SEQ.map((c) => Object.assign({}, c));
@@ -1461,6 +1468,15 @@ function BeachTrip({ canEdit = true } = {}) {
   React.useEffect(() => {
     let alive = true;
     (async () => {
+      // Bump this whenever the built-in storyboard changes so an old saved
+      // project (e.g. the previous set of photos) is replaced with the new one.
+      const SEQ_VERSION = 'relax-2026';
+      let storedVer = null;
+      try { storedVer = localStorage.getItem('beachtrip:seqver'); } catch (e) {}
+      if (storedVer !== SEQ_VERSION) {
+        try { await pdbClearAll(); } catch (e) {}
+        try { localStorage.setItem('beachtrip:seqver', SEQ_VERSION); } catch (e) {}
+      }
       let saved = null;
       try { saved = await pdbGetClips(); } catch (e) {}
       const base = (saved && Array.isArray(saved) && saved.length) ? saved : freshDefault();
@@ -1821,6 +1837,7 @@ function BeachTripApp() {
     if (docUnsub.current) { docUnsub.current(); docUnsub.current = null; }
     try { const { auth } = await loadFirebase(); await auth.signOut(); } catch (e) {}
     _clearIdent(); setMe(null); setPhase('signin');
+    try { if (typeof location !== 'undefined') location.reload(); } catch (e) {}
   };
 
   // ── chrome chung cho các màn full-screen ───────────────────────────────────
@@ -2063,6 +2080,5 @@ const btnGhost = { width: '100%', height: 46, borderRadius: 11, border: '1px sol
 const inputStyle2 = { width: '100%', boxSizing: 'border-box', height: 46, fontFamily: VFONT, fontSize: 15, fontWeight: 500, color: '#13303c', background: '#fff', border: '1px solid #d4dde2', borderRadius: 11, padding: '0 14px', outline: 'none' };
 const errBox = { marginTop: 14, padding: '11px 14px', background: '#fdeeec', border: '1px solid #f3d4cf', borderRadius: 11, color: '#b5483c', fontFamily: VFONT, fontSize: 13, fontWeight: 600, lineHeight: 1.5 };
 const menuItem = { display: 'flex', alignItems: 'center', gap: 11, width: '100%', padding: '13px 16px', border: 'none', background: 'transparent', color: '#3a5562', fontFamily: VFONT, fontSize: 14.5, fontWeight: 700, cursor: 'pointer', textAlign: 'left' };
-
 window.BeachTripApp = BeachTripApp;
 
