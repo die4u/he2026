@@ -1,4 +1,8 @@
 // @ds-adherence-ignore -- omelette starter scaffold (raw elements/hex/px by design)
+import React from 'react';
+import { useAuthActions } from '@convex-dev/auth/react';
+import { useConvexAuth, useQuery, useMutation } from 'convex/react';
+import { api } from './convex/_generated/api';
 
 /* BEGIN USAGE */
 // animations.jsx
@@ -843,6 +847,21 @@ function BeachMusic() {
   const wantPlayRef = React.useRef(false);
   const hasCustom = !!trackUrl;
 
+  // Nhận lệnh unmute từ BeachTripApp sau khi login thành công
+  React.useEffect(() => {
+    const handler = () => {
+      setMuted(false);
+      setVolume(0.6);
+      if (setPlaying) setPlaying(true);
+      // Set wantPlayRef trước để unlock handler không pause ngay
+      wantPlayRef.current = true;
+      const a = audioRef.current;
+      if (a) { a.muted = false; a.volume = 0.6; a.play().catch(() => {}); }
+    };
+    window.addEventListener('beachtrip:unmute', handler);
+    return () => window.removeEventListener('beachtrip:unmute', handler);
+  }, [setPlaying]);
+
   // Unlock audio on the first user gesture anywhere (browsers block play()/
   // AudioContext from a deferred effect until the user has interacted once).
   React.useEffect(() => {
@@ -1151,7 +1170,7 @@ function BeachMusic() {
   };
 
   return (
-    <div style={{ position: 'absolute', top: 24, right: 24, zIndex: 30, display: 'flex', alignItems: 'center', gap: 10 }}>
+    <div style={{ position: 'absolute', bottom: 24, right: 24, zIndex: 30, display: 'flex', alignItems: 'center', gap: 10 }}>
       <audio ref={audioRef} loop preload="auto" />
       <input ref={fileInputRef} type="file" accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.flac,.opus,.weba" onChange={onPick} style={{ display: 'none' }} />
 
@@ -1230,21 +1249,7 @@ const DEFAULT_SEQ = [
 const freshDefault = () => DEFAULT_SEQ.map((c) => Object.assign({}, c));
 
 // IndexedDB project store: clip list (meta) + uploaded image blobs (imgs)
-const projDB = () => new Promise((res, rej) => {
-  const o = indexedDB.open('beachtrip-project', 1);
-  o.onupgradeneeded = () => {
-    const db = o.result;
-    if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
-    if (!db.objectStoreNames.contains('imgs')) db.createObjectStore('imgs');
-  };
-  o.onerror = () => rej(o.error);
-  o.onsuccess = () => res(o.result);
-});
-const pdbGetClips = async () => { const db = await projDB(); return new Promise((res, rej) => { const rq = db.transaction('meta').objectStore('meta').get('clips'); rq.onsuccess = () => res(rq.result || null); rq.onerror = () => rej(rq.error); }); };
-const pdbSaveClips = async (clips) => { const db = await projDB(); return new Promise((res, rej) => { const tx = db.transaction('meta', 'readwrite'); tx.objectStore('meta').put(clips, 'clips'); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); };
-const pdbPutImg = async (key, blob) => { const db = await projDB(); return new Promise((res, rej) => { const tx = db.transaction('imgs', 'readwrite'); tx.objectStore('imgs').put(blob, key); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); };
-const pdbGetImg = async (key) => { const db = await projDB(); return new Promise((res, rej) => { const rq = db.transaction('imgs').objectStore('imgs').get(key); rq.onsuccess = () => res(rq.result || null); rq.onerror = () => rej(rq.error); }); };
-const pdbClearAll = async () => { const db = await projDB(); return new Promise((res, rej) => { const tx = db.transaction(['meta', 'imgs'], 'readwrite'); tx.objectStore('meta').clear(); tx.objectStore('imgs').clear(); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); };
+// IndexedDB đã được thay bằng Convex DB + Storage (xem convex/storyboard.ts, convex/storage.ts)
 
 // Downscale an uploaded image to keep things light (long side ≤ 2000px, q=0.9)
 function resizeToBlob(file, max = 2000, q = 0.9) {
@@ -1436,13 +1441,27 @@ function EditorPanel({ clips, urls, onUpdate, onRemove, onMove, onAddPhotos, onI
 
 function BeachTrip({ canEdit = true } = {}) {
   const OVERLAP = 0.5;
-  const [clips, setClips] = React.useState(null); // null = loading from store
-  const [urls, setUrls] = React.useState({});     // imgKey -> objectURL
+  const SEQ_VERSION = 'relax-2026';
+
+  // ── Convex hooks ─────────────────────────────────────────────────────────────
+  const savedBoard    = useQuery(api.storyboard.myStoryboard);
+  const imageUrls     = useQuery(api.storage.myImageUrls) ?? {};
+  const saveStoryboard   = useMutation(api.storyboard.saveStoryboard);
+  const clearStoryboard  = useMutation(api.storyboard.clearStoryboard);
+  const genUploadUrl     = useMutation(api.storage.generateUploadUrl);
+  const saveImage        = useMutation(api.storage.saveImage);
+  const deleteImage      = useMutation(api.storage.deleteImage);
+  const deleteAllImages  = useMutation(api.storage.deleteAllImages);
+
+  // ── Local state ───────────────────────────────────────────────────────────────
+  const [clips, setClips] = React.useState(null); // null = loading
   const [editing, setEditing] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [restartSignal, setRestartSignal] = React.useState(0);
   const [isFs, setIsFs] = React.useState(false);
   const rootRef = React.useRef(null);
+  const initDone = React.useRef(false);
+
   React.useEffect(() => {
     const onFs = () => setIsFs(!!document.fullscreenElement);
     document.addEventListener('fullscreenchange', onFs);
@@ -1455,54 +1474,62 @@ function BeachTrip({ canEdit = true } = {}) {
     } catch (e) {}
   };
 
-  // Replay from the beginning whenever the set of images/clips changes.
-  // We bump a signal the Stage watches (imperative seek-to-0 + play) instead of
-  // remounting the Stage — remounting tore down the live music element, which is
-  // what caused the soundtrack to go silent / need a manual click after edits.
+  // Bump signal → Stage seeks to 0 + plays, tanpa remounting (giữ nhạc sống)
   const restartFromStart = () => {
     try { localStorage.setItem('beachtrip:t', '0'); } catch (e) {}
     setRestartSignal((n) => n + 1);
   };
 
-  // Load saved project (or defaults) + resolve uploaded image blobs to URLs
+  // Khởi tạo clips từ Convex (chỉ chạy một lần khi savedBoard load xong)
   React.useEffect(() => {
-    let alive = true;
-    (async () => {
-      // Bump this whenever the built-in storyboard changes so an old saved
-      // project (e.g. the previous set of photos) is replaced with the new one.
-      const SEQ_VERSION = 'relax-2026';
-      let storedVer = null;
-      try { storedVer = localStorage.getItem('beachtrip:seqver'); } catch (e) {}
-      if (storedVer !== SEQ_VERSION) {
-        try { await pdbClearAll(); } catch (e) {}
-        try { localStorage.setItem('beachtrip:seqver', SEQ_VERSION); } catch (e) {}
-      }
-      let saved = null;
-      try { saved = await pdbGetClips(); } catch (e) {}
-      const base = (saved && Array.isArray(saved) && saved.length) ? saved : freshDefault();
-      const u = {};
-      for (const c of base) {
-        if (c.imgKey) {
-          try { const blob = await pdbGetImg(c.imgKey); if (blob) u[c.imgKey] = URL.createObjectURL(blob); } catch (e) {}
-        }
-      }
-      if (!alive) return;
-      setUrls(u);
-      setClips(base);
-    })();
-    return () => { alive = false; };
-  }, []);
+    if (savedBoard === undefined) return; // đang load
+    if (initDone.current) return;
+    initDone.current = true;
 
-  const persist = (next) => { pdbSaveClips(next).catch(() => {}); return next; };
-  const onUpdate = (id, patch) => setClips((prev) => persist(prev.map((c) => (c.id === id ? Object.assign({}, c, patch) : c))));
-  const onRemove = (id) => { setClips((prev) => persist(prev.filter((c) => c.id !== id))); restartFromStart(); };
+    if (savedBoard && savedBoard.version === SEQ_VERSION) {
+      try {
+        const parsed = JSON.parse(savedBoard.clips);
+        if (Array.isArray(parsed) && parsed.length) { setClips(parsed); return; }
+      } catch (_) {}
+    }
+    // Không có board hợp lệ → reset về default và xóa data cũ
+    if (savedBoard) {
+      clearStoryboard().catch(() => {});
+      deleteAllImages().catch(() => {});
+    }
+    setClips(freshDefault());
+  }, [savedBoard]);
+
+  // Persist clips lên Convex mỗi khi thay đổi (debounced qua useEffect)
+  const clipsRef = React.useRef(null);
+  React.useEffect(() => {
+    if (!clips || !initDone.current) return;
+    clipsRef.current = clips;
+    const t = setTimeout(() => {
+      if (clipsRef.current === clips) {
+        saveStoryboard({ clips: JSON.stringify(clips), version: SEQ_VERSION }).catch(() => {});
+      }
+    }, 800);
+    return () => clearTimeout(t);
+  }, [clips]);
+
+  // ── Clip mutators ─────────────────────────────────────────────────────────────
+  const onUpdate = (id, patch) => setClips((prev) => prev.map((c) => (c.id === id ? Object.assign({}, c, patch) : c)));
+  const onRemove = (id) => {
+    setClips((prev) => {
+      const c = prev.find((x) => x.id === id);
+      if (c && c.imgKey) deleteImage({ imgKey: c.imgKey }).catch(() => {});
+      return prev.filter((x) => x.id !== id);
+    });
+    restartFromStart();
+  };
   const onMove = (id, dir) => {
     setClips((prev) => {
       const i = prev.findIndex((c) => c.id === id);
       const j = i + dir;
       if (i < 0 || j < 0 || j >= prev.length) return prev;
       const a = prev.slice(); const tmp = a[i]; a[i] = a[j]; a[j] = tmp;
-      return persist(a);
+      return a;
     });
     restartFromStart();
   };
@@ -1511,21 +1538,29 @@ function BeachTrip({ canEdit = true } = {}) {
       const at = (atIndex == null || atIndex > prev.length) ? prev.length : Math.max(0, atIndex);
       const a = prev.slice();
       a.splice(at, 0, { id: 'c' + Date.now(), type: 'title', title: 'TIÊU ĐỀ MỚI', sub: '', dur: 2.6, variant: 'mini' });
-      return persist(a);
+      return a;
     });
     restartFromStart();
   };
   const onClearAll = async () => {
-    try {
-      const db = await projDB();
-      await new Promise((r) => { const tx = db.transaction('imgs', 'readwrite'); tx.objectStore('imgs').clear(); tx.oncomplete = () => r(); tx.onerror = () => r(); });
-    } catch (e) {}
-    setUrls((prev) => { Object.values(prev).forEach((u) => { try { URL.revokeObjectURL(u); } catch (e) {} }); return {}; });
-    setClips(persist([]));
+    await deleteAllImages().catch(() => {});
+    setClips([]);
     restartFromStart();
   };
-  // Bulk import: images paired with a per-line script. Each script line maps to
-  // one image (in filename order): "Lời minh hoạ | Dòng phụ | Thời lượng".
+
+  // ── Upload helper: resize → Convex Storage → URL object local ────────────────
+  const uploadImage = async (file, key) => {
+    let blob;
+    try { blob = await resizeToBlob(file, 2000, 0.9); } catch (e) { blob = file; }
+    const uploadUrl = await genUploadUrl();
+    const res = await fetch(uploadUrl, { method: 'POST', headers: { 'Content-Type': blob.type }, body: blob });
+    const { storageId } = await res.json();
+    await saveImage({ imgKey: key, storageId });
+    // Tạo URL tạm thời local để hiển thị ngay (Convex query sẽ refresh sau)
+    return URL.createObjectURL(blob);
+  };
+
+  // Bulk import: images paired with a per-line script
   const onImportScript = async (files, scriptText) => {
     const arr = Array.from(files || []).filter((f) => f.type && f.type.indexOf('image/') === 0);
     if (!arr.length) return;
@@ -1533,14 +1568,10 @@ function BeachTrip({ canEdit = true } = {}) {
     const lines = (scriptText || '').split('\n').map((s) => s.trim()).filter(Boolean);
     setBusy(true);
     const stamp = Date.now();
-    const newUrls = {};
     const newClips = [];
     for (let i = 0; i < arr.length; i++) {
-      let blob;
-      try { blob = await resizeToBlob(arr[i], 2000, 0.9); } catch (e) { blob = arr[i]; }
       const key = 'up_' + stamp + '_' + i;
-      try { await pdbPutImg(key, blob); } catch (e) {}
-      newUrls[key] = URL.createObjectURL(blob);
+      try { await uploadImage(arr[i], key); } catch (e) { console.error(e); }
       const parts = (lines[i] || '').split('|').map((s) => s.trim());
       const cap = parts[0] || '';
       const sub = parts[1] || '';
@@ -1549,10 +1580,9 @@ function BeachTrip({ canEdit = true } = {}) {
       const POSMAP = { tl: 'top-left', tc: 'top-center', tr: 'top-right', ml: 'middle-left', c: 'center', mr: 'middle-right', bl: 'bottom-left', bc: 'bottom-center', br: 'bottom-right' };
       const posKey = (parts[3] || '').toLowerCase().replace(/[\s_]+/g, '-');
       const pos = POSMAP[posKey] || (['top-left', 'top-center', 'top-right', 'middle-left', 'center', 'middle-right', 'bottom-left', 'bottom-center', 'bottom-right'].indexOf(posKey) >= 0 ? posKey : 'bottom-left');
-      newClips.push({ id: 'c' + stamp + '_' + i, imgKey: key, cap: cap, sub: sub, dur: dur, pos: pos });
+      newClips.push({ id: 'c' + stamp + '_' + i, imgKey: key, cap, sub, dur, pos });
     }
-    setUrls((u) => Object.assign({}, u, newUrls));
-    setClips((prev) => persist(prev.concat(newClips)));
+    setClips((prev) => prev.concat(newClips));
     setBusy(false);
     restartFromStart();
   };
@@ -1561,29 +1591,24 @@ function BeachTrip({ canEdit = true } = {}) {
     if (!arr.length) return;
     setBusy(true);
     const stamp = Date.now();
-    const newUrls = {};
     const newClips = [];
     for (let i = 0; i < arr.length; i++) {
-      let blob;
-      try { blob = await resizeToBlob(arr[i], 2000, 0.9); } catch (e) { blob = arr[i]; }
       const key = 'up_' + stamp + '_' + i;
-      try { await pdbPutImg(key, blob); } catch (e) {}
-      newUrls[key] = URL.createObjectURL(blob);
+      try { await uploadImage(arr[i], key); } catch (e) { console.error(e); }
       newClips.push({ id: 'c' + stamp + '_' + i, imgKey: key, cap: '', dur: 5.0, pos: 'bottom-left' });
     }
-    setUrls((u) => Object.assign({}, u, newUrls));
     setClips((prev) => {
       const at = (atIndex == null || atIndex > prev.length) ? prev.length : Math.max(0, atIndex);
       const a = prev.slice();
       a.splice(at, 0, ...newClips);
-      return persist(a);
+      return a;
     });
     setBusy(false);
     restartFromStart();
   };
   const onReset = async () => {
-    try { await pdbClearAll(); } catch (e) {}
-    setUrls((prev) => { Object.values(prev).forEach((u) => { try { URL.revokeObjectURL(u); } catch (e) {} }); return {}; });
+    await clearStoryboard().catch(() => {});
+    await deleteAllImages().catch(() => {});
     setClips(freshDefault());
     restartFromStart();
   };
@@ -1601,7 +1626,7 @@ function BeachTrip({ canEdit = true } = {}) {
     const dur = c.dur != null ? c.dur : 3.0;
     const start = t;
     t += (dur - OVERLAP);
-    const src = c.imgKey ? urls[c.imgKey] : c.src;
+    const src = c.imgKey ? (imageUrls[c.imgKey] ?? null) : c.src;
     return Object.assign({}, c, { src, start, dur, end: start + dur });
   });
   const total = t + OVERLAP + 0.4;
@@ -1650,7 +1675,7 @@ function BeachTrip({ canEdit = true } = {}) {
 
         {editing && canEdit && (
           <EditorPanel
-            clips={clips} urls={urls} busy={busy}
+            clips={clips} urls={imageUrls} busy={busy}
             onUpdate={onUpdate} onRemove={onRemove} onMove={onMove}
             onAddPhotos={onAddPhotos} onImportScript={onImportScript}
             onInsertTitle={onInsertTitle}
@@ -1663,57 +1688,13 @@ function BeachTrip({ canEdit = true } = {}) {
   );
 }
 
-window.BeachTrip = BeachTrip;
+// ════════════════════════════════════════════════════════════════════════════
+//  ĐĂNG NHẬP (Convex Auth · Google) + PHÊ DUYỆT (Convex DB)
+// ════════════════════════════════════════════════════════════════════════════
 
-// ════════════════════════════════════════════════════════════════════════════
-//  ĐĂNG NHẬP (Firebase Auth · Google) + PHÊ DUYỆT (Firestore)
-//  Sửa cấu hình ở FIREBASE_CONFIG / ADMIN_EMAIL nếu cần.
-// ════════════════════════════════════════════════════════════════════════════
-const ADMIN_EMAIL = 'lqdieu1981@gmail.com';
-// Chế độ "đăng nhập thử" (mock) tự TẮT khi chạy trên domain production thật,
-// và tự BẬT khi xem trước / localhost. Thêm domain thật của bạn vào đây nếu dùng tên miền riêng.
+// Mock login tự BẬT khi localhost/preview, TẮT khi production
 const PROD_HOSTS = ['die4u.github.io', 'slideimages-ef18f.web.app', 'slideimages-ef18f.firebaseapp.com'];
 const ALLOW_MOCK_LOGIN = (typeof location === 'undefined') ? true : !PROD_HOSTS.includes(location.hostname);
-const FIREBASE_CONFIG = {
-  apiKey: "AIzaSyA5TOwFw2vvwfsXF7p3_-8imN64j4cULf8",
-  authDomain: "slideimages-ef18f.firebaseapp.com",
-  projectId: "slideimages-ef18f",
-  storageBucket: "slideimages-ef18f.firebasestorage.app",
-  messagingSenderId: "592591735292",
-  appId: "1:592591735292:web:737d52f0b0ea8f51668a79",
-  measurementId: "G-E313P3NG1J"
-};
-const FB_VER = '10.12.5';
-const IDENT_KEY = 'beachtrip_identity_v1';
-
-function _injectScript(src) {
-  return new Promise((res, rej) => {
-    if ([].some.call(document.scripts, (s) => s.src === src)) { res(); return; }
-    const s = document.createElement('script');
-    s.src = src; s.async = false;
-    s.onload = () => res();
-    s.onerror = () => rej(new Error('Không tải được ' + src));
-    document.head.appendChild(s);
-  });
-}
-let _fbReady = null;
-function loadFirebase() {
-  if (_fbReady) return _fbReady;
-  _fbReady = (async () => {
-    const base = 'https://www.gstatic.com/firebasejs/' + FB_VER + '/';
-    if (!window.firebase) await _injectScript(base + 'firebase-app-compat.js');
-    if (!window.firebase.auth) await _injectScript(base + 'firebase-auth-compat.js');
-    if (!window.firebase.firestore) await _injectScript(base + 'firebase-firestore-compat.js');
-    if (!window.firebase.apps.length) window.firebase.initializeApp(FIREBASE_CONFIG);
-    return { fb: window.firebase, auth: window.firebase.auth(), db: window.firebase.firestore() };
-  })();
-  return _fbReady;
-}
-const _sanitize = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-const _isAdminEmail = (e) => !!e && e.toLowerCase() === ADMIN_EMAIL.toLowerCase();
-const _saveIdent = (id) => { try { localStorage.setItem(IDENT_KEY, JSON.stringify(id)); } catch (e) {} };
-const _loadIdent = () => { try { return JSON.parse(localStorage.getItem(IDENT_KEY) || 'null'); } catch (e) { return null; } };
-const _clearIdent = () => { try { localStorage.removeItem(IDENT_KEY); } catch (e) {} };
 
 const ROLE_LABEL = { viewer: 'Quyền xem', editor: 'Xem + Sửa kịch bản' };
 const STATUS_META = {
@@ -1740,104 +1721,53 @@ function Avatar({ name, photo, size = 36 }) {
 }
 
 function BeachTripApp() {
-  const [phase, setPhase] = React.useState('loading'); // loading | signin | pending | rejected | app | error
-  const [me, setMe] = React.useState(null);
+  const { isLoading: authLoading, isAuthenticated } = useConvexAuth();
+  const { signIn, signOut } = useAuthActions();
+
+  // Profile từ Convex DB — tự realtime khi được duyệt
+  const me = useQuery(api.users.me);
+  const upsertCurrentUser = useMutation(api.users.upsertCurrentUser);
+
   const [busy, setBusy] = React.useState(false);
   const [loginErr, setLoginErr] = React.useState('');
-  const [showMock, setShowMock] = React.useState(false);
-  const [mockEmail, setMockEmail] = React.useState('');
-  const [mockName, setMockName] = React.useState('');
   const [accountOpen, setAccountOpen] = React.useState(false);
   const [adminOpen, setAdminOpen] = React.useState(false);
-  const docUnsub = React.useRef(null);
 
-  const startSession = React.useCallback(async (id) => {
-    try {
-      setPhase('loading');
-      const { db, fb } = await loadFirebase();
-      const ref = db.collection('users').doc(id.uid);
-      const snap = await ref.get();
-      const admin = _isAdminEmail(id.email);
-      const ts = fb.firestore.FieldValue.serverTimestamp();
-      if (!snap.exists) {
-        await ref.set({
-          email: id.email || '', displayName: id.displayName || id.email || '', photoURL: id.photoURL || '',
-          role: admin ? 'editor' : 'viewer', status: admin ? 'approved' : 'pending',
-          isAdmin: admin, mock: !!id.mock, createdAt: ts, updatedAt: ts,
-        });
-      } else {
-        const patch = { email: id.email || '', displayName: id.displayName || snap.data().displayName || '', photoURL: id.photoURL || snap.data().photoURL || '' };
-        if (admin) { patch.role = 'editor'; patch.status = 'approved'; patch.isAdmin = true; }
-        await ref.update(patch);
-      }
-      if (docUnsub.current) docUnsub.current();
-      docUnsub.current = ref.onSnapshot((s) => {
-        if (!s.exists) { setPhase('signin'); return; }
-        const d = s.data();
-        setMe(Object.assign({ uid: id.uid }, d));
-        setPhase(d.status === 'approved' ? 'app' : d.status === 'rejected' ? 'rejected' : 'pending');
-      });
-    } catch (e) {
-      setLoginErr('Lỗi kết nối Firestore: ' + (e && e.message ? e.message : e) + '. Kiểm tra Rules cho phép đọc/ghi collection "users".');
-      setPhase('error');
-    }
-  }, []);
+  const autoPlayDone = React.useRef(false);
+  const [needsTap, setNeedsTap] = React.useState(false);
 
+  // Mỗi lần login: tạo/sync profile
+  const upsertDone = React.useRef(false);
   React.useEffect(() => {
-    let alive = true; let unsubAuth = null;
-    loadFirebase().then(({ auth }) => {
-      unsubAuth = auth.onAuthStateChanged((u) => {
-        if (!alive) return;
-        if (u) {
-          const id = { uid: u.uid, email: u.email, displayName: u.displayName, photoURL: u.photoURL, mock: false };
-          _saveIdent(id); startSession(id);
-        } else {
-          const m = _loadIdent();
-          if (m && m.mock) startSession(m);
-          else setPhase('signin');
-        }
-      });
-    }).catch((e) => {
-      setLoginErr('Không tải được Firebase SDK: ' + (e && e.message ? e.message : e));
-      setPhase('error');
-    });
-    return () => { alive = false; if (unsubAuth) unsubAuth(); if (docUnsub.current) docUnsub.current(); };
-  }, [startSession]);
+    if (!isAuthenticated) { upsertDone.current = false; return; }
+    if (me === undefined) return;
+    if (upsertDone.current) return;
+    upsertDone.current = true;
+    upsertCurrentUser({ displayName: '', photoURL: '', mock: false }).catch(() => {});
+  }, [isAuthenticated, me, upsertCurrentUser]);
+
+  // Hiện overlay tap-to-start sau khi approved (browser block autoplay)
+  React.useEffect(() => {
+    if (!isAuthenticated || !me || me.status !== 'approved') return;
+    if (autoPlayDone.current) return;
+    autoPlayDone.current = true;
+    try { localStorage.setItem('beachtrip:muted', '0'); localStorage.setItem('beachtrip:vol', '0.6'); } catch (e) {}
+    setNeedsTap(true);
+  }, [isAuthenticated, me]);
 
   const signInGoogle = async () => {
     setLoginErr(''); setBusy(true);
     try {
-      const { auth, fb } = await loadFirebase();
-      const provider = new fb.auth.GoogleAuthProvider();
-      await auth.signInWithPopup(provider); // onAuthStateChanged tiếp quản
+      await signIn('google');
     } catch (e) {
       setBusy(false);
-      const code = (e && e.code) || '';
-      if (code.indexOf('unauthorized-domain') >= 0) {
-        setLoginErr('Tên miền xem trước chưa được Firebase cấp phép. Hãy dùng “Đăng nhập thử” bên dưới để xem luồng, hoặc thêm domain vào Authentication → Settings → Authorized domains khi deploy.');
-      } else if (code.indexOf('popup') >= 0) {
-        setLoginErr('Cửa sổ Google bị chặn trong khung xem trước. Hãy dùng “Đăng nhập thử” bên dưới.');
-      } else {
-        setLoginErr('Không đăng nhập được: ' + (e && e.message ? e.message : e));
-      }
-      if (ALLOW_MOCK_LOGIN) setShowMock(true);
+      setLoginErr('Không đăng nhập được: ' + (e && e.message ? e.message : e));
     }
-  };
-
-  const signInMock = () => {
-    const email = (mockEmail || '').trim();
-    if (!email || email.indexOf('@') < 1) { setLoginErr('Vui lòng nhập email hợp lệ.'); return; }
-    setLoginErr('');
-    const id = { uid: 'mock_' + _sanitize(email), email, displayName: (mockName || '').trim() || email.split('@')[0], photoURL: '', mock: true };
-    _saveIdent(id); startSession(id);
   };
 
   const doSignOut = async () => {
     setAccountOpen(false); setAdminOpen(false);
-    if (docUnsub.current) { docUnsub.current(); docUnsub.current = null; }
-    try { const { auth } = await loadFirebase(); await auth.signOut(); } catch (e) {}
-    _clearIdent(); setMe(null); setPhase('signin');
-    try { if (typeof location !== 'undefined') location.reload(); } catch (e) {}
+    await signOut();
   };
 
   // ── chrome chung cho các màn full-screen ───────────────────────────────────
@@ -1845,29 +1775,38 @@ function BeachTripApp() {
     style: { position: 'absolute', inset: 0, background: SCREEN_BG, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24, fontFamily: VFONT, boxSizing: 'border-box' }
   }, children);
 
-  if (phase === 'loading') {
+  // Đang kiểm tra auth hoặc đang load profile
+  if (authLoading || (isAuthenticated && me === undefined)) {
     return React.createElement(Centered, null,
       React.createElement('div', { style: { color: 'rgba(255,255,255,0.92)', fontWeight: 700, fontSize: 22 } }, 'Đang tải…'));
   }
 
-  if (phase === 'error') {
-    return React.createElement(Centered, null,
-      React.createElement('div', { style: { maxWidth: 460, textAlign: 'center', color: '#fff' } },
-        React.createElement('div', { style: { fontWeight: 800, fontSize: 24, marginBottom: 12 } }, 'Có lỗi xảy ra'),
-        React.createElement('div', { style: { fontSize: 15, lineHeight: 1.6, color: 'rgba(255,255,255,0.8)', marginBottom: 20 } }, loginErr),
-        React.createElement('button', { onClick: () => { setPhase('signin'); setLoginErr(''); }, style: btnGhost }, 'Quay lại')));
-  }
+  if (!isAuthenticated || me === null) return renderSignin();
 
-  if (phase === 'signin') return renderSignin();
-  if (phase === 'pending') return renderStatus('pending');
-  if (phase === 'rejected') return renderStatus('rejected');
+  if (me.status === 'pending') return renderStatus('pending');
+  if (me.status === 'rejected') return renderStatus('rejected');
 
-  // phase === 'app'
-  const canEdit = !!me && (me.isAdmin || me.role === 'editor');
+  // status === 'approved'
+  const canEdit = !!(me.isAdmin || me.role === 'editor');
+
+  const handleTap = () => {
+    setNeedsTap(false);
+    window.dispatchEvent(new CustomEvent('beachtrip:unmute'));
+  };
+
   return React.createElement('div', { style: { position: 'absolute', inset: 0, background: '#06121a' } },
     React.createElement(BeachTrip, { canEdit }),
     renderAccountChip(),
-    adminOpen && me && me.isAdmin ? React.createElement(AdminPanel, { meUid: me.uid, onClose: () => setAdminOpen(false) }) : null
+    adminOpen && me.isAdmin ? React.createElement(AdminPanel, { meId: me._id, onClose: () => setAdminOpen(false) }) : null,
+    needsTap ? React.createElement('div', {
+      onClick: handleTap,
+      style: { position: 'absolute', inset: 0, zIndex: 99, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16, background: 'rgba(6,18,26,0.72)', backdropFilter: 'blur(6px)', cursor: 'pointer', fontFamily: VFONT }
+    },
+      React.createElement('svg', { width: 64, height: 64, viewBox: '0 0 24 24', fill: 'none', stroke: 'rgba(255,255,255,0.9)', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' },
+        React.createElement('polygon', { points: '5 3 19 12 5 21 5 3', fill: 'rgba(255,255,255,0.15)' })),
+      React.createElement('div', { style: { color: 'rgba(255,255,255,0.92)', fontSize: 20, fontWeight: 700 } }, 'Nhấn để bắt đầu'),
+      React.createElement('div', { style: { color: 'rgba(255,255,255,0.5)', fontSize: 14 } }, 'Hình ảnh & âm nhạc sẽ tự phát')
+    ) : null
   );
 
   // ── render helpers ──────────────────────────────────────────────────────────
@@ -1882,20 +1821,7 @@ function BeachTripApp() {
         React.createElement('button', { onClick: signInGoogle, disabled: busy, style: btnGoogle },
           React.createElement(GoogleG, { size: 21 }),
           React.createElement('span', null, busy ? 'Đang mở Google…' : 'Đăng nhập bằng Google')),
-        loginErr ? React.createElement('div', { style: errBox }, loginErr) : null,
-        ALLOW_MOCK_LOGIN ? React.createElement(React.Fragment, null,
-          React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 12, margin: '20px 0 4px' } },
-            React.createElement('div', { style: { flex: 1, height: 1, background: '#e0e8eb' } }),
-            React.createElement('div', { style: { fontSize: 12, fontWeight: 700, color: '#9bb0b8', letterSpacing: '0.08em' } }, showMock ? 'ĐĂNG NHẬP THỬ' : 'HOẶC'),
-            React.createElement('div', { style: { flex: 1, height: 1, background: '#e0e8eb' } })),
-          showMock
-            ? React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 9, marginTop: 12 } },
-                React.createElement('div', { style: { fontSize: 12.5, color: '#7d949d', lineHeight: 1.5 } }, 'Chế độ thử (không cần popup Google) — nhập email để mô phỏng người dùng. Quyền vẫn được lưu thật trên Firestore.'),
-                React.createElement('input', { value: mockEmail, onChange: (e) => setMockEmail(e.target.value), placeholder: 'email@gmail.com', onKeyDown: (e) => { if (e.key === 'Enter') signInMock(); }, style: inputStyle2 }),
-                React.createElement('input', { value: mockName, onChange: (e) => setMockName(e.target.value), placeholder: 'Tên hiển thị (tuỳ chọn)', style: inputStyle2 }),
-                React.createElement('button', { onClick: signInMock, style: btnPrimary }, 'Vào thử'))
-            : React.createElement('button', { onClick: () => setShowMock(true), style: { ...btnGhost, marginTop: 12 } }, 'Đăng nhập thử (xem trước luồng)')
-        ) : null
+        loginErr ? React.createElement('div', { style: errBox }, loginErr) : null
       ));
   }
 
@@ -1919,7 +1845,7 @@ function BeachTripApp() {
   function renderAccountChip() {
     if (!me) return null;
     const role = me.isAdmin ? 'editor' : me.role;
-    return React.createElement('div', { style: { position: 'absolute', top: 24, right: 88, zIndex: 45, fontFamily: VFONT } },
+    return React.createElement('div', { style: { position: 'absolute', top: 24, right: 84, zIndex: 45, fontFamily: VFONT } },
       React.createElement('button', { onClick: () => setAccountOpen((v) => !v), title: 'Tài khoản', style: { display: 'flex', alignItems: 'center', gap: 9, height: 52, padding: '0 14px 0 8px', borderRadius: 999, border: '1px solid rgba(255,255,255,0.25)', background: 'rgba(8,18,26,0.42)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)', color: '#fff', cursor: 'pointer', boxShadow: '0 4px 18px rgba(0,0,0,0.3)' } },
         React.createElement(Avatar, { name: me.displayName, photo: me.photoURL, size: 36 }),
         React.createElement('span', { style: { fontSize: 14.5, fontWeight: 700, maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, me.displayName || me.email)),
@@ -1938,63 +1864,39 @@ function BeachTripApp() {
 }
 
 // ── Trang Admin: danh sách user + duyệt/quyền ─────────────────────────────────
-function AdminPanel({ meUid, onClose }) {
-  const [users, setUsers] = React.useState(null);
-  const [archive, setArchive] = React.useState(null); // kho email bị từ chối
+function AdminPanel({ meId, onClose }) {
+  const users = useQuery(api.users.listUsers);
+  const archive = useQuery(api.users.listRejectedEmails);
+  const approveUser   = useMutation(api.users.approveUser);
+  const setPending    = useMutation(api.users.setPendingUser);
+  const rejectUser    = useMutation(api.users.rejectUser);
+  const setUserRole   = useMutation(api.users.setUserRole);
+  const deleteUser    = useMutation(api.users.deleteUser);
+
   const [filter, setFilter] = React.useState('all'); // all | pending | approved | rejected | archive
-  React.useEffect(() => {
-    let unsub = null; let alive = true;
-    loadFirebase().then(({ db }) => {
-      unsub = db.collection('users').onSnapshot((qs) => {
-        if (!alive) return;
-        const arr = qs.docs.map((d) => Object.assign({ uid: d.id }, d.data()));
-        arr.sort((a, b) => {
-          const ord = { pending: 0, approved: 1, rejected: 2 };
-          if ((ord[a.status] ?? 9) !== (ord[b.status] ?? 9)) return (ord[a.status] ?? 9) - (ord[b.status] ?? 9);
-          return (a.email || '').localeCompare(b.email || '');
-        });
-        setUsers(arr);
-      }, () => setUsers([]));
+
+  const patch = async (userId, data) => {
+    if (data.status === 'approved') { await approveUser({ userId }); return; }
+    if (data.status === 'pending')  { await setPending({ userId }); return; }
+    if (data.role) await setUserRole({ userId, role: data.role });
+  };
+  const reject = async (u) => { await rejectUser({ userId: u._id }); };
+  const remove = async (userId, label) => {
+    if (!window.confirm('Xoá tài khoản “' + (label || userId) + '”?\nNgười này có thể đăng nhập lại để chờ duyệt từ đầu.')) return;
+    await deleteUser({ userId });
+  };
+
+  const sortedUsers = React.useMemo(() => {
+    if (!users) return null;
+    const ord = { pending: 0, approved: 1, rejected: 2 };
+    return [...users].sort((a, b) => {
+      if ((ord[a.status] ?? 9) !== (ord[b.status] ?? 9)) return (ord[a.status] ?? 9) - (ord[b.status] ?? 9);
+      return (a.email || '').localeCompare(b.email || '');
     });
-    return () => { alive = false; if (unsub) unsub(); };
-  }, []);
+  }, [users]);
 
-  React.useEffect(() => {
-    let unsub = null; let alive = true;
-    loadFirebase().then(({ db }) => {
-      unsub = db.collection('rejectedEmails').onSnapshot((qs) => {
-        if (!alive) return;
-        const arr = qs.docs.map((d) => Object.assign({ id: d.id }, d.data()));
-        arr.sort((a, b) => (a.email || '').localeCompare(b.email || ''));
-        setArchive(arr);
-      }, () => setArchive([]));
-    });
-    return () => { alive = false; if (unsub) unsub(); };
-  }, []);
-
-  const patch = async (uid, data) => {
-    const { db, fb } = await loadFirebase();
-    await db.collection('users').doc(uid).update(Object.assign({ updatedAt: fb.firestore.FieldValue.serverTimestamp() }, data));
-  };
-  const reject = async (u) => {
-    const { db, fb } = await loadFirebase();
-    const ts = fb.firestore.FieldValue.serverTimestamp();
-    await db.collection('users').doc(u.uid).update({ status: 'rejected', updatedAt: ts });
-    if (u.email) await db.collection('rejectedEmails').doc(_sanitize(u.email)).set({ email: u.email, displayName: u.displayName || '', photoURL: u.photoURL || '', rejectedAt: ts }, { merge: true });
-  };
-  const remove = async (uid, label) => {
-    if (!window.confirm('Xoá tài khoản "' + (label || uid) + '"?\nNgười này có thể đăng nhập lại để chờ duyệt từ đầu.')) return;
-    const { db } = await loadFirebase();
-    await db.collection('users').doc(uid).delete();
-  };
-  const removeArchive = async (id, label) => {
-    if (!window.confirm('Xoá "' + (label || id) + '" khỏi kho lưu trữ email từ chối?')) return;
-    const { db } = await loadFirebase();
-    await db.collection('rejectedEmails').doc(id).delete();
-  };
-
-  const list = (users || []).filter((u) => filter === 'all' || u.status === filter);
-  const counts = (users || []).reduce((a, u) => { a[u.status] = (a[u.status] || 0) + 1; return a; }, {});
+  const list = (sortedUsers || []).filter((u) => filter === 'all' || u.status === filter);
+  const counts = (sortedUsers || []).reduce((a, u) => { a[u.status] = (a[u.status] || 0) + 1; return a; }, {});
   const archiveList = archive || [];
 
   const tab = (key, label) => React.createElement('button', { key, onClick: () => setFilter(key), style: { fontFamily: VFONT, fontSize: 13.5, fontWeight: 700, padding: '7px 14px', borderRadius: 999, border: 'none', cursor: 'pointer', background: filter === key ? '#0c6d7e' : '#eef3f4', color: filter === key ? '#fff' : '#5a7682' } },
@@ -2005,7 +1907,7 @@ function AdminPanel({ meUid, onClose }) {
       React.createElement('div', { style: { padding: '20px 24px', background: '#0e4257', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
         React.createElement('div', null,
           React.createElement('div', { style: { fontSize: 20, fontWeight: 800 } }, 'Duyệt người dùng'),
-          React.createElement('div', { style: { fontSize: 13.5, color: 'rgba(255,255,255,0.72)', marginTop: 2 } }, (users ? users.length : 0) + ' tài khoản · ' + (counts.pending || 0) + ' chờ duyệt')),
+          React.createElement('div', { style: { fontSize: 13.5, color: 'rgba(255,255,255,0.72)', marginTop: 2 } }, (sortedUsers ? sortedUsers.length : 0) + ' tài khoản · ' + (counts.pending || 0) + ' chờ duyệt')),
         React.createElement('button', { onClick: onClose, style: { width: 38, height: 38, borderRadius: 999, border: 'none', background: 'rgba(255,255,255,0.16)', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' } },
           React.createElement('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2.4, strokeLinecap: 'round' }, React.createElement('line', { x1: 6, y1: 6, x2: 18, y2: 18 }), React.createElement('line', { x1: 18, y1: 6, x2: 6, y2: 18 })))),
       React.createElement('div', { style: { padding: '14px 24px', display: 'flex', gap: 8, borderBottom: '1px solid #e3eaec', background: '#fff' } },
@@ -2014,33 +1916,30 @@ function AdminPanel({ meUid, onClose }) {
         React.createElement('button', { onClick: () => setFilter('archive'), style: { fontFamily: VFONT, fontSize: 13.5, fontWeight: 700, padding: '7px 14px', borderRadius: 999, border: 'none', cursor: 'pointer', background: filter === 'archive' ? '#5a3a4a' : '#f1e6ea', color: filter === 'archive' ? '#fff' : '#a05a72' } }, 'Kho từ chối' + (archiveList.length ? ' · ' + archiveList.length : ''))),
       React.createElement('div', { style: { padding: 16, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10 } },
         filter === 'archive'
-          ? (archive === null
+          ? (archive === undefined
               ? React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#8aa0a8', fontWeight: 600 } }, 'Đang tải kho…')
               : archiveList.length === 0
                 ? React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#8aa0a8', fontWeight: 600 } }, 'Chưa có email từ chối nào được lưu.')
                 : [React.createElement('div', { key: '_hint', style: { fontSize: 12.5, color: '#9bb0b8', fontWeight: 600, padding: '0 4px 2px', lineHeight: 1.5 } }, 'Email đã từng bị từ chối — lưu độc lập, giữ lại kể cả khi đã xoá tài khoản.')].concat(
-                    archiveList.map((a) => React.createElement('div', { key: a.id, style: { background: '#fff', border: '1px solid #e6edef', borderRadius: 13, padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 12 } },
-                      React.createElement(Avatar, { name: a.displayName || a.email, photo: a.photoURL, size: 38 }),
+                    archiveList.map((a) => React.createElement('div', { key: a._id, style: { background: '#fff', border: '1px solid #e6edef', borderRadius: 13, padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 12 } },
+                      React.createElement(Avatar, { name: a.email, photo: '', size: 38 }),
                       React.createElement('div', { style: { flex: 1, minWidth: 0 } },
-                        React.createElement('div', { style: { fontSize: 15, fontWeight: 800, color: '#13303c', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, a.email),
-                        a.displayName ? React.createElement('div', { style: { fontSize: 13, color: '#7d949d', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1 } }, a.displayName) : null),
+                        React.createElement('div', { style: { fontSize: 15, fontWeight: 800, color: '#13303c', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, a.email)),
                       React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 11px', borderRadius: 999, background: STATUS_META.rejected.bg, color: STATUS_META.rejected.color, fontSize: 12.5, fontWeight: 800, flexShrink: 0 } },
-                        React.createElement('span', { style: { width: 7, height: 7, borderRadius: 999, background: STATUS_META.rejected.color } }), 'Từ chối'),
-                      React.createElement('button', { onClick: () => removeArchive(a.id, a.email), title: 'Xoá khỏi kho', style: { display: 'flex', alignItems: 'center', justifyContent: 'center', width: 38, height: 38, borderRadius: 9, border: '1px solid #f0dad6', background: '#fff', color: '#c0504d', cursor: 'pointer', flexShrink: 0 } },
-                        React.createElement('svg', { width: 17, height: 17, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' }, React.createElement('polyline', { points: '3 6 5 6 21 6' }), React.createElement('path', { d: 'M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2' }), React.createElement('line', { x1: 10, y1: 11, x2: 10, y2: 17 }), React.createElement('line', { x1: 14, y1: 11, x2: 14, y2: 17 }))))))
+                        React.createElement('span', { style: { width: 7, height: 7, borderRadius: 999, background: STATUS_META.rejected.color } }), 'Từ chối'))))
             )
-          : users === null
+          : sortedUsers === null
             ? React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#8aa0a8', fontWeight: 600 } }, 'Đang tải danh sách…')
             : list.length === 0
               ? React.createElement('div', { style: { padding: 40, textAlign: 'center', color: '#8aa0a8', fontWeight: 600 } }, 'Không có tài khoản nào.')
-              : list.map((u) => React.createElement(AdminRow, { key: u.uid, u, isSelf: u.uid === meUid, patch, reject, remove }))
+              : list.map((u) => React.createElement(AdminRow, { key: u._id, u, isSelf: u._id === meId, patch, reject, remove }))
       )));
 }
 
 function AdminRow({ u, isSelf, patch, reject, remove }) {
   const sm = STATUS_META[u.status] || STATUS_META.pending;
   const roleBtn = (key, label) => React.createElement('button', {
-    key, disabled: u.isAdmin, onClick: () => patch(u.uid, { role: key }),
+    key, disabled: u.isAdmin, onClick: () => patch(u._id, { role: key }),
     style: { fontFamily: VFONT, fontSize: 12.5, fontWeight: 700, padding: '6px 11px', borderRadius: 8, cursor: u.isAdmin ? 'default' : 'pointer', border: '1px solid ' + (u.role === key ? '#0c6d7e' : '#d4dde2'), background: u.role === key ? '#0c6d7e' : '#fff', color: u.role === key ? '#fff' : '#5a7682', opacity: u.isAdmin ? 0.5 : 1 }
   }, label);
   const actBtn = (label, onClick, kind) => React.createElement('button', { onClick, style: { fontFamily: VFONT, fontSize: 13, fontWeight: 700, padding: '8px 14px', borderRadius: 9, border: 'none', cursor: 'pointer', background: kind === 'approve' ? '#0c6d7e' : kind === 'reject' ? '#f3e2e0' : '#eef3f4', color: kind === 'approve' ? '#fff' : kind === 'reject' ? '#c0504d' : '#5a7682' } }, label);
@@ -2064,11 +1963,11 @@ function AdminRow({ u, isSelf, patch, reject, remove }) {
       isSelf
         ? React.createElement('span', { style: { fontSize: 12.5, color: '#9bb0b8', fontWeight: 600 } }, 'Tài khoản của bạn')
         : React.createElement('div', { style: { display: 'flex', gap: 8 } },
-            u.status !== 'approved' ? actBtn('Duyệt', () => patch(u.uid, { status: 'approved' }), 'approve') : null,
+            u.status !== 'approved' ? actBtn('Duyệt', () => patch(u._id, { status: 'approved' }), 'approve') : null,
             u.status !== 'rejected' ? actBtn('Từ chối', () => reject(u), 'reject') : null,
-            u.status === 'approved' ? actBtn('Thu hồi', () => patch(u.uid, { status: 'pending' }), 'neutral') : null,
-            u.status === 'rejected' ? actBtn('Mở lại', () => patch(u.uid, { status: 'pending' }), 'neutral') : null,
-            React.createElement('button', { onClick: () => remove(u.uid, u.displayName || u.email), title: 'Xoá tài khoản', style: { display: 'flex', alignItems: 'center', justifyContent: 'center', width: 38, height: 38, borderRadius: 9, border: '1px solid #f0dad6', background: '#fff', color: '#c0504d', cursor: 'pointer', flexShrink: 0 } },
+            u.status === 'approved' ? actBtn('Thu hồi', () => patch(u._id, { status: 'pending' }), 'neutral') : null,
+            u.status === 'rejected' ? actBtn('Mở lại', () => patch(u._id, { status: 'pending' }), 'neutral') : null,
+            React.createElement('button', { onClick: () => remove(u._id, u.displayName || u.email), title: 'Xoá tài khoản', style: { display: 'flex', alignItems: 'center', justifyContent: 'center', width: 38, height: 38, borderRadius: 9, border: '1px solid #f0dad6', background: '#fff', color: '#c0504d', cursor: 'pointer', flexShrink: 0 } },
               React.createElement('svg', { width: 17, height: 17, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' }, React.createElement('polyline', { points: '3 6 5 6 21 6' }), React.createElement('path', { d: 'M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2' }), React.createElement('line', { x1: 10, y1: 11, x2: 10, y2: 17 }), React.createElement('line', { x1: 14, y1: 11, x2: 14, y2: 17 }))))));
 }
 
@@ -2080,5 +1979,6 @@ const btnGhost = { width: '100%', height: 46, borderRadius: 11, border: '1px sol
 const inputStyle2 = { width: '100%', boxSizing: 'border-box', height: 46, fontFamily: VFONT, fontSize: 15, fontWeight: 500, color: '#13303c', background: '#fff', border: '1px solid #d4dde2', borderRadius: 11, padding: '0 14px', outline: 'none' };
 const errBox = { marginTop: 14, padding: '11px 14px', background: '#fdeeec', border: '1px solid #f3d4cf', borderRadius: 11, color: '#b5483c', fontFamily: VFONT, fontSize: 13, fontWeight: 600, lineHeight: 1.5 };
 const menuItem = { display: 'flex', alignItems: 'center', gap: 11, width: '100%', padding: '13px 16px', border: 'none', background: 'transparent', color: '#3a5562', fontFamily: VFONT, fontSize: 14.5, fontWeight: 700, cursor: 'pointer', textAlign: 'left' };
-window.BeachTripApp = BeachTripApp;
+
+export { BeachTripApp };
 
